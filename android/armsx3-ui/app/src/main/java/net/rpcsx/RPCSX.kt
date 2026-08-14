@@ -95,6 +95,10 @@ class RPCSX {
     external fun processCompilationQueue(): Boolean
     external fun startMainThreadProcessor(): Boolean
     external fun overlayPadData(port: Int, digital1: Int, digital2: Int, leftStickX: Int, leftStickY: Int, rightStickX: Int, rightStickY: Int): Boolean
+    /** Analog pressure per pressure-capable button, in CELL_PAD press-offset order
+     *  (RIGHT, LEFT, UP, DOWN, TRIANGLE, CIRCLE, CROSS, SQUARE, L1, R1, L2, R2),
+     *  each 1..255, or 0 to leave that button digital. */
+    external fun overlayPadPressure(port: Int, values: IntArray): Boolean
     external fun collectGameInfo(rootDir: String, progressId: Long): Boolean
     external fun systemInfo(): String
     external fun settingsGet(path: String): String
@@ -105,10 +109,27 @@ class RPCSX {
     external fun getState() : Int
     external fun kill()
     external fun resume()
+    external fun pause()
     external fun openHomeMenu()
     external fun loginUser(userId: String)
     external fun getUser(): String
     external fun getTitleId(): String
+    /** The running game's trophy folder name (NPWR comm id, e.g. "NPWR05636_00").
+     *
+     *  Empty when no game is running, when the game has not called
+     *  sceNpTrophyCreateContext yet (many only do on reaching a menu), or when it has
+     *  no trophies. Returns null on a core too old to export it, so callers must treat
+     *  the result as nullable despite the declared type. */
+    external fun getCurrentTrophyName(): String
+    /** Pin the Adreno GPU to max clocks (no DVFS ramp) or release it. No-ops on non-Adreno.
+     *  Costs heat and battery, so it is opt-in. Safe before the core is loaded -- adrenotools
+     *  is linked into the JNI library, not the core. */
+    external fun setGpuTurbo(on: Boolean)
+    /** ADPF telemetry: flip-to-flip period, CPU work in that window, and the presenting
+     *  thread's OS tid. All return 0 when not yet measured -- treat 0 as "skip". */
+    external fun getFramePeriodNs(): Long
+    external fun getFrameWorkNs(): Long
+    external fun getRsxThreadTid(): Int
     external fun supportsCustomDriverLoading(): Boolean
     external fun saveState(): Boolean
     external fun loadState(index: Int): Boolean
@@ -119,6 +140,7 @@ class RPCSX {
     external fun saveStateToSlot(slot: Int): Boolean
     external fun loadStateFromSlot(slot: Int): Boolean
     external fun hasStateInSlot(slot: Int): Boolean
+    external fun patchEngineVersion(): String
     external fun patchesImport(content: String): Int
     external fun patchesList(serial: String): String
     external fun probeDiscInfo(isoPath: String, iconOut: String): String

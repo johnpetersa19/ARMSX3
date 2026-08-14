@@ -91,7 +91,10 @@ object Rpcs3Settings {
      * frame_limit_type is an ENUM of preset rates, not a free integer:
      * Off | 30 | 50 | 60 | 120 | Display | Auto | PS3 Native | Infinite
      */
-    fun setFrameLimitMode(mode: String) = setEnum("$VIDEO@@Frame limit", mode)
+    fun setFrameLimitMode(mode: String): Boolean {
+        val ok = setEnum("$VIDEO@@Frame limit", mode)
+        return ok
+    }
 
     /**
      * ARMSX2's Display FPS Cap slider is free-form (0..60, any value), which the
@@ -103,6 +106,10 @@ object Rpcs3Settings {
      * the lower of the pair wins and the slider appears to stick.
      */
     fun setFrameLimit(fps: Int) {
+        // Remembered so the PCSX2 FrameLimitEnable key can restore the rate the user actually
+        // picked instead of overwriting it -- see setFrameLimitEnabled.
+        lastExplicitFpsCap = fps
+
         val preset = when (fps) {
             30, 50, 60, 120 -> fps.toString()
             else -> null
@@ -116,6 +123,40 @@ object Rpcs3Settings {
         } else {
             setFrameLimitMode("Off")
             setSecondFrameLimit(fps.toFloat())
+        }
+    }
+
+    /** The last rate the explicit FPS-cap control asked for. 0 = no cap set. */
+    @Volatile
+    private var lastExplicitFpsCap: Int = 0
+
+    /**
+     * PCSX2's "limiter on/off" toggle, which shares one RPCS3 node with the explicit FPS cap.
+     *
+     * It used to write "Auto" whenever it was on. Both are pushed on every apply and this one goes
+     * LAST, so a user who picked 30 or 60 got "Auto" a moment later and the cap never took effect
+     * -- reported as "FPS cap (30/60) doesn't seem to apply". Exactly the collision the
+     * SkipDuplicateFrames and IntegerScaling comments below describe, in the node above them.
+     *
+     * Dropping the key was not an option: unlike those two it has a visible row behind it, so it
+     * would have gone inert. Instead it defers to the explicit cap, which makes the result
+     * independent of the order the two are emitted in -- the property the other fixes rely on
+     * applyToInner's ordering for.
+     */
+    fun setFrameLimitEnabled(enabled: Boolean) {
+
+        if (!enabled) {
+            setFrameLimitMode("Off")
+            setSecondFrameLimit(0f)
+            return
+        }
+
+        val cap = lastExplicitFpsCap
+        if (cap > 0) {
+            setFrameLimit(cap)
+        } else {
+            // No explicit rate to honour, so "limit on" means the console's own pacing.
+            setFrameLimitMode("Auto")
         }
     }
 
@@ -201,6 +242,29 @@ object Rpcs3Settings {
 
     fun setTimeStretching(enabled: Boolean) = setBool("$AUDIO@@Enable Time Stretching", enabled)
 
+    /**
+     * Which cubeb backend delivers the audio, or auto.
+     *
+     * Android builds aaudio, opensl and audiotrack, and cubeb's auto order takes AAudio first on
+     * anything modern -- so OpenSL has never run for a user. AAudio's low-latency path takes the
+     * smallest buffers the device will grant, which underruns first when the emulator cannot hold
+     * full speed; OpenSL is higher latency and much harder to starve. Exposed because the devices
+     * reporting audio stutter are ones we cannot reproduce on, so it has to be A/B-able in the
+     * field rather than guessed at here.
+     *
+     * A backend that is unavailable falls back to auto in the core, so a bad pick cannot leave
+     * someone with no sound.
+     */
+    fun setCubebBackend(index: Int) = setString(
+        "$AUDIO@@Cubeb Backend",
+        when (index) {
+            1 -> "aaudio"
+            2 -> "opensl"
+            3 -> "audiotrack"
+            else -> "" // auto
+        },
+    )
+
     // ---- Core / CPU -----------------------------------------------------
 
     /**
@@ -269,6 +333,8 @@ object Rpcs3Settings {
     // ---- Misc -----------------------------------------------------------
 
     fun setShowTrophyPopups(enabled: Boolean) = setBool("$MISC@@Show trophy popups", enabled)
+
+    fun setSilenceAllLogs(enabled: Boolean) = setBool("$MISC@@Silence All Logs", enabled)
 
     fun setPauseOnHomeMenu(enabled: Boolean) =
         setBool("$MISC@@Pause Emulation During Home Menu", enabled)
@@ -374,7 +440,10 @@ object Rpcs3Settings {
 
     private val XFLOAT = arrayOf("Accurate", "Approximate", "Relaxed", "Inaccurate")
     private val SLEEP_TIMERS = arrayOf("As Host", "Usleep Only", "All Timers")
-    private val AUDIO_RENDERERS = arrayOf("Null", "XAudio2", "Cubeb", "FAudio")
+    // Index -> core enum NAME (the core parses by name, not ordinal, so this array is the
+    // contract). Oboe appends rather than inserting: the first four indices are baked into
+    // saved settings.
+    private val AUDIO_RENDERERS = arrayOf("Null", "XAudio2", "Cubeb", "FAudio", "Oboe")
 
     /** PS3 output resolution. Ordinals must match video_resolution exactly. */
     val RESOLUTIONS = arrayOf(

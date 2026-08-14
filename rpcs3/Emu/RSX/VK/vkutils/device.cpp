@@ -4,7 +4,14 @@
 #include "instance.h"
 #include "util/logs.hpp"
 #include "Emu/system_config.h"
+#include "Emu/system_utils.hpp"
+#include "Utilities/File.h"
+
+#include <cstring>
 #include <vulkan/vulkan_core.h>
+#ifdef __ANDROID__
+#include "Emu/RSX/VK/vk_android_loader.h"
+#endif
 #ifdef __APPLE__
 #include <vulkan/vulkan_beta.h>
 #endif
@@ -127,6 +134,7 @@ namespace vk
 		optional_features_support.conditional_rendering    = device_extensions.is_supported(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
 
 		optional_features_support.external_memory_host     = device_extensions.is_supported(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+		optional_features_support.memory_budget            = device_extensions.is_supported(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 		optional_features_support.synchronization_2        = device_extensions.is_supported(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
 		optional_features_support.unrestricted_depth_range = device_extensions.is_supported(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 #ifdef __APPLE__
@@ -245,6 +253,42 @@ namespace vk
 		get_physical_device_properties_1(allow_extensions);
 
 		rsx_log.always()("Found Vulkan-compatible GPU: '%s' running on driver %s", get_name(), get_driver_version());
+
+		// ARMSX3: say WHICH driver this is, not just its version.
+		//
+		// The version alone does not identify a driver, and on Android it is actively
+		// misleading: adrenotools' hook falls back to the system driver when its dlopen
+		// fails, so a session that silently ran the system driver looks here exactly like
+		// one that ran the custom driver it was asked for. Every report naming a custom
+		// driver is untrustworthy without this.
+		if (driver_properties.driverID)
+		{
+			rsx_log.always()("Vulkan driver identity: '%s' (driverID %u), info '%s', conformance %u.%u.%u.%u",
+				driver_properties.driverName,
+				static_cast<u32>(driver_properties.driverID),
+				driver_properties.driverInfo,
+				static_cast<u32>(driver_properties.conformanceVersion.major),
+				static_cast<u32>(driver_properties.conformanceVersion.minor),
+				static_cast<u32>(driver_properties.conformanceVersion.subminor),
+				static_cast<u32>(driver_properties.conformanceVersion.patch));
+		}
+		else
+		{
+			rsx_log.always()("Vulkan driver identity: VK_KHR_driver_properties unavailable, inferred from the GPU name only");
+		}
+
+#ifdef __ANDROID__
+		// A custom driver was asked for, and the driver that answered is Qualcomm's own.
+		// adrenotools installs Mesa/Turnip builds, so this combination means the load
+		// failed and the fallback took over. It reports that here because the only other
+		// trace is a logcat line from hook_impl, which never reaches a bug report.
+		if (vk::android::using_custom_driver() && get_driver_vendor() == driver_vendor::ADRENO)
+		{
+			rsx_log.error("A custom Vulkan driver was requested, but the driver in use is Qualcomm's own. "
+				"It most likely failed to load and fell back silently; `adb logcat | grep hook_impl` has the reason. "
+				"Treat this session as running the SYSTEM driver.");
+		}
+#endif
 
 		if (get_driver_vendor() == driver_vendor::RADV && get_name().find("LLVM 8.0.0") != umax)
 		{
@@ -694,6 +738,17 @@ namespace vk
 			requested_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 		}
 
+		// Without this, VMA has no idea how much memory the driver will actually
+		// part with, and falls back to reporting the heap size -- or, where we set
+		// one, our own configured cap. Every eviction decision is made from that
+		// number, so on a device whose real ceiling is far below the cap the load
+		// reads low right up until an allocation fails outright. See the note on
+		// VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT in memory.cpp.
+		if (pgpu->optional_features_support.memory_budget)
+		{
+			requested_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		}
+
 		if (pgpu->optional_features_support.shader_stencil_export)
 		{
 			requested_extensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
@@ -1004,6 +1059,9 @@ namespace vk
 		memory_map = vk::get_memory_mapping(pdev);
 		m_formats_support = vk::get_optimal_tiling_supported_formats(pdev);
 
+		// Needs a live 'dev'. Never fatal: on failure the handle stays VK_NULL_HANDLE.
+		load_pipeline_cache();
+
 		if (g_cfg.video.disable_vulkan_mem_allocator)
 		{
 			m_allocator = std::make_unique<vk::mem_allocator_vk>(*this, pdev);
@@ -1014,8 +1072,198 @@ namespace vk
 		}
 
 		// Useful for debugging different VRAM configurations
-		const u64 vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
+		u64 vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
+
+#ifdef __ANDROID__
+		// The 65536 MB default is desktop-oriented and meaningless here, where the Vulkan
+		// "device local" heap is shared system RAM and the driver over-reports it badly (~15 GB
+		// on an 8 GB device). Note this is a GPU-driver figure: it is NOT sysconf, and the
+		// often-repeated "zRAM inflates it" explanation is wrong -- zRAM is compressed swap and
+		// never counts toward totalram. Left at the default the texture and surface caches never
+		// evict,
+		// and the Low Memory Killer takes the process with no fatal logged: the session just
+		// disappears. Derive the budget from honest physical RAM instead of the heap figure.
+		// An explicit user value is always honoured.
+		// Ported in spirit from ouroboros420/rpcsx (a3156fcb3), reading MemTotal directly
+		// rather than depending on their app-pushed budget.
+		if (g_cfg.video.vk.vram_allocation_limit == 65536)
+		{
+			u64 phys_ram_bytes = 0;
+
+			if (fs::file meminfo{"/proc/meminfo"})
+			{
+				const std::string text = meminfo.to_string();
+				if (const usz pos = text.find("MemTotal:"); pos != umax)
+				{
+					// "MemTotal:  8123456 kB"
+					if (const u64 kb = std::strtoull(text.c_str() + pos + 9, nullptr, 10); kb > 0)
+					{
+						phys_ram_bytes = kb * 1024ull;
+					}
+				}
+			}
+
+			// Half of physical RAM. The emulator's own working set (PPU/SPU caches, guest
+			// memory, JIT) is the other consumer and is not counted in this budget, so a
+			// larger fraction just moves the kill later rather than preventing it.
+			vram_allocation_limit = phys_ram_bytes
+				? phys_ram_bytes / 2
+				: std::min<u64>(memory_map.device_local_total_bytes / 2, 2048ull * 0x100000ull);
+
+			rsx_log.notice("Android: VRAM cache budget = %llu MB (physical RAM %llu MB, driver reports a %llu MB device-local heap); override with 'VRAM allocation limit (MB)'.",
+				vram_allocation_limit / 0x100000, phys_ram_bytes / 0x100000, memory_map.device_local_total_bytes / 0x100000);
+		}
+#endif
+
 		memory_map.device_local_total_bytes = std::min(memory_map.device_local_total_bytes, vram_allocation_limit);
+	}
+
+	// Prepended to the serialized blob so foreign / stale / corrupt data is rejected here
+	// rather than handed to the driver. Ported from ouroboros420/rpcsx (7392cca10f).
+	namespace
+	{
+		struct pipeline_cache_disk_header
+		{
+			u32 length;   // sizeof(header), guards against layout drift
+			u32 version;
+			u32 vendorID;
+			u32 deviceID;
+			u8 uuid[VK_UUID_SIZE];
+		};
+
+		constexpr u32 k_pipeline_cache_disk_version = 1;
+	}
+
+	std::string render_device::get_pipeline_cache_path() const
+	{
+		// Deliberately the no-arg (shared) cache dir, not get_cache_dir_by_serial: the driver's
+		// compiled form of a pipeline is keyed on the driver, not on the game, so one blob
+		// warms every title. Also callable at device-create time, with no Emu state up yet.
+		return rpcs3::utils::get_cache_dir() + "vk_pipeline_cache.bin";
+	}
+
+	void render_device::load_pipeline_cache()
+	{
+		m_pipeline_cache = VK_NULL_HANDLE;
+		m_pipeline_cache_saved_size = 0;
+
+		std::vector<u8> initial_data;
+
+		if (fs::file f{ get_pipeline_cache_path(), fs::read })
+		{
+			const u64 file_size = f.size();
+
+			// Upper bound is a sanity guard, not a policy: a blob this large means the file
+			// is not ours, and reading it into memory would be the actual damage.
+			if (file_size > sizeof(pipeline_cache_disk_header) && file_size < (256ull << 20))
+			{
+				std::vector<u8> blob(file_size);
+				if (f.read(blob.data(), file_size) == file_size)
+				{
+					pipeline_cache_disk_header hdr{};
+					std::memcpy(&hdr, blob.data(), sizeof(hdr));
+
+					const auto& props = pgpu->props;
+					const bool header_ok =
+						hdr.length == sizeof(pipeline_cache_disk_header) &&
+						hdr.version == k_pipeline_cache_disk_version &&
+						hdr.vendorID == props.vendorID &&
+						hdr.deviceID == props.deviceID &&
+						std::memcmp(hdr.uuid, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+
+					if (header_ok)
+					{
+						initial_data.assign(blob.begin() + sizeof(pipeline_cache_disk_header), blob.end());
+					}
+					else
+					{
+						rsx_log.notice("vk: on-disk pipeline cache rejected (driver or device changed); rebuilding.");
+					}
+				}
+			}
+		}
+
+		VkPipelineCacheCreateInfo create_info{};
+		create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+		create_info.initialDataSize = initial_data.size();
+		create_info.pInitialData = initial_data.empty() ? nullptr : initial_data.data();
+
+		VkPipelineCache cache = VK_NULL_HANDLE;
+		const VkResult res = vkCreatePipelineCache(dev, &create_info, nullptr, &cache);
+
+		if (res == VK_SUCCESS && cache != VK_NULL_HANDLE)
+		{
+			m_pipeline_cache = cache;
+			rsx_log.notice("vk: driver pipeline cache active (seeded with %zu bytes).", initial_data.size());
+		}
+		else
+		{
+			rsx_log.warning("vk: vkCreatePipelineCache failed (0x%x); continuing without a driver pipeline cache.", static_cast<u32>(res));
+		}
+	}
+
+	void render_device::save_pipeline_cache() const
+	{
+		if (m_pipeline_cache == VK_NULL_HANDLE)
+		{
+			return;
+		}
+
+		// Legal mid-session: the cache is created with flags=0, so the driver internally
+		// synchronizes vkGetPipelineCacheData against concurrent pipeline creation. The only
+		// callers are flip() and destroy(), which cannot overlap, so no lock of our own.
+		usz data_size = 0;
+		if (vkGetPipelineCacheData(dev, m_pipeline_cache, &data_size, nullptr) != VK_SUCCESS || !data_size)
+		{
+			return;
+		}
+
+		// Steady state costs one size query: nothing new compiled, nothing to rewrite.
+		if (data_size == m_pipeline_cache_saved_size)
+		{
+			return;
+		}
+
+		std::vector<u8> blob(data_size);
+		if (vkGetPipelineCacheData(dev, m_pipeline_cache, &data_size, blob.data()) != VK_SUCCESS)
+		{
+			return;
+		}
+
+		blob.resize(data_size); // the driver may hand back fewer bytes than it quoted
+
+		pipeline_cache_disk_header hdr{};
+		hdr.length = sizeof(pipeline_cache_disk_header);
+		hdr.version = k_pipeline_cache_disk_version;
+		hdr.vendorID = pgpu->props.vendorID;
+		hdr.deviceID = pgpu->props.deviceID;
+		std::memcpy(hdr.uuid, pgpu->props.pipelineCacheUUID, VK_UUID_SIZE);
+
+		fs::create_path(rpcs3::utils::get_cache_dir());
+
+		// Atomic temp+rename. Being killed mid-write must not leave a truncated blob, or every
+		// later boot reads it, fails the header check and rebuilds from cold forever.
+		fs::pending_file out(get_pipeline_cache_path());
+		if (out.file &&
+			out.file.write(&hdr, sizeof(hdr)) == sizeof(hdr) &&
+			(blob.empty() || out.file.write(blob.data(), blob.size()) == blob.size()) &&
+			out.commit())
+		{
+			m_pipeline_cache_saved_size = data_size;
+		}
+	}
+
+	void render_device::save_and_destroy_pipeline_cache()
+	{
+		if (m_pipeline_cache == VK_NULL_HANDLE)
+		{
+			return;
+		}
+
+		save_pipeline_cache();
+
+		vkDestroyPipelineCache(dev, m_pipeline_cache, nullptr);
+		m_pipeline_cache = VK_NULL_HANDLE;
 	}
 
 	void render_device::destroy()
@@ -1032,6 +1280,10 @@ namespace vk
 				m_allocator->destroy();
 				m_allocator.reset();
 			}
+
+			// Before vkDestroyDevice, and after the pipe compiler workers have been joined,
+			// so nothing can be creating pipelines against the cache while we serialize it.
+			save_and_destroy_pipeline_cache();
 
 			vkDestroyDevice(dev, nullptr);
 			dev = nullptr;

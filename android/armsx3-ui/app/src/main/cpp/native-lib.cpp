@@ -1,7 +1,11 @@
 #include <algorithm>
+#include <android/api-level.h>
 #include <android/dlext.h>
 #include <android/log.h>
+#include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
+#include <elf.h>
 #include <jni.h>
 #include <optional>
 #include <string>
@@ -19,6 +23,7 @@
 struct RPCSXApi {
   bool (*overlayPadData)(int port, int digital1, int digital2, int leftStickX,
                          int leftStickY, int rightStickX, int rightStickY);
+  bool (*overlayPadPressure)(int port, const int *values, int count);
   bool (*initialize)(std::string_view rootDir, std::string_view user);
   void (*setSocInfo)(std::string_view socInfo);
   bool (*processCompilationQueue)(JNIEnv *env);
@@ -30,8 +35,13 @@ struct RPCSXApi {
   int (*getState)();
   void (*kill)();
   void (*resume)();
+  void (*pause)();
   void (*openHomeMenu)();
   std::string (*getTitleId)();
+  unsigned long long (*getFramePeriodNs)();
+  unsigned long long (*getFrameWorkNs)();
+  int (*getRsxThreadTid)();
+  std::string (*getCurrentTrophyName)();
   bool (*surfaceEvent)(JNIEnv *env, jobject surface, jint event);
   void (*surfaceSizeChanged)(int width, int height);
   bool (*usbDeviceEvent)(int fd, int vendorId, int productId, int event);
@@ -52,6 +62,7 @@ struct RPCSXApi {
   bool (*uninstallGame)(std::string_view path);
   std::string (*getVersion)();
   void *(*setCustomDriver)(void *driverHandle);
+  void (*reportDriverProblem)(std::string message);
   bool (*saveState)();
   bool (*loadState)(unsigned int index);
   bool (*hasState)(unsigned int index);
@@ -61,6 +72,7 @@ struct RPCSXApi {
   bool (*saveStateToSlot)(unsigned int slot);
   bool (*loadStateFromSlot)(unsigned int slot);
   bool (*hasStateInSlot)(unsigned int slot);
+  std::string (*patchEngineVersion)();
   int (*patchesImport)(std::string_view content);
   std::string (*patchesList)(std::string_view serial);
   std::string (*probeDiscInfo)(std::string_view isoPath, std::string_view iconOut);
@@ -104,6 +116,7 @@ struct RPCSXLibrary : RPCSXApi {
 
     // clang-format off
     result.overlayPadData = reinterpret_cast<decltype(overlayPadData)>(dlsym(handle, "_rpcsx_overlayPadData"));
+    result.overlayPadPressure = reinterpret_cast<decltype(overlayPadPressure)>(dlsym(handle, "_rpcsx_overlayPadPressure"));
     result.initialize = reinterpret_cast<decltype(initialize)>(dlsym(handle, "_rpcsx_initialize"));
     result.setSocInfo = reinterpret_cast<decltype(setSocInfo)>(dlsym(handle, "_rpcsx_setSocInfo"));
     result.processCompilationQueue = reinterpret_cast<decltype(processCompilationQueue)>(dlsym(handle, "_rpcsx_processCompilationQueue"));
@@ -114,8 +127,13 @@ struct RPCSXLibrary : RPCSXApi {
     result.getState = reinterpret_cast<decltype(getState)>(dlsym(handle, "_rpcsx_getState"));
     result.kill = reinterpret_cast<decltype(kill)>(dlsym(handle, "_rpcsx_kill"));
     result.resume = reinterpret_cast<decltype(resume)>(dlsym(handle, "_rpcsx_resume"));
+    result.pause = reinterpret_cast<decltype(pause)>(dlsym(handle, "_rpcsx_pause"));
     result.openHomeMenu = reinterpret_cast<decltype(openHomeMenu)>(dlsym(handle, "_rpcsx_openHomeMenu"));
     result.getTitleId = reinterpret_cast<decltype(getTitleId)>(dlsym(handle, "_rpcsx_getTitleId"));
+    result.getFramePeriodNs = reinterpret_cast<decltype(getFramePeriodNs)>(dlsym(handle, "_rpcsx_getFramePeriodNs"));
+    result.getFrameWorkNs = reinterpret_cast<decltype(getFrameWorkNs)>(dlsym(handle, "_rpcsx_getFrameWorkNs"));
+    result.getRsxThreadTid = reinterpret_cast<decltype(getRsxThreadTid)>(dlsym(handle, "_rpcsx_getRsxThreadTid"));
+    result.getCurrentTrophyName = reinterpret_cast<decltype(getCurrentTrophyName)>(dlsym(handle, "_rpcsx_getCurrentTrophyName"));
     result.surfaceEvent = reinterpret_cast<decltype(surfaceEvent)>(dlsym(handle, "_rpcsx_surfaceEvent"));
     result.surfaceSizeChanged = reinterpret_cast<decltype(surfaceSizeChanged)>(dlsym(handle, "_rpcsx_surfaceSizeChanged"));
     result.usbDeviceEvent = reinterpret_cast<decltype(usbDeviceEvent)>(dlsym(handle, "_rpcsx_usbDeviceEvent"));
@@ -135,12 +153,14 @@ struct RPCSXLibrary : RPCSXApi {
     result.uninstallGame = reinterpret_cast<decltype(uninstallGame)>(dlsym(handle, "_rpcsx_uninstallGame"));
     result.getVersion = reinterpret_cast<decltype(getVersion)>(dlsym(handle, "_rpcsx_getVersion"));
     result.setCustomDriver = reinterpret_cast<decltype(setCustomDriver)>(dlsym(handle, "_rpcsx_setCustomDriver"));
+    result.reportDriverProblem = reinterpret_cast<decltype(reportDriverProblem)>(dlsym(handle, "_rpcsx_reportDriverProblem"));
     result.saveState = reinterpret_cast<decltype(saveState)>(dlsym(handle, "_rpcsx_saveState"));
     result.loadState = reinterpret_cast<decltype(loadState)>(dlsym(handle, "_rpcsx_loadState"));
     result.hasState = reinterpret_cast<decltype(hasState)>(dlsym(handle, "_rpcsx_hasState"));
     result.saveStateToSlot = reinterpret_cast<decltype(saveStateToSlot)>(dlsym(handle, "_rpcsx_saveStateToSlot"));
     result.loadStateFromSlot = reinterpret_cast<decltype(loadStateFromSlot)>(dlsym(handle, "_rpcsx_loadStateFromSlot"));
     result.hasStateInSlot = reinterpret_cast<decltype(hasStateInSlot)>(dlsym(handle, "_rpcsx_hasStateInSlot"));
+    result.patchEngineVersion = reinterpret_cast<decltype(patchEngineVersion)>(dlsym(handle, "_rpcsx_patchEngineVersion"));
     result.patchesImport = reinterpret_cast<decltype(patchesImport)>(dlsym(handle, "_rpcsx_patchesImport"));
     result.patchesList = reinterpret_cast<decltype(patchesList)>(dlsym(handle, "_rpcsx_patchesList"));
     result.probeDiscInfo = reinterpret_cast<decltype(probeDiscInfo)>(dlsym(handle, "_rpcsx_probeDiscInfo"));
@@ -199,6 +219,35 @@ extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_overlayPadData(
 
   return rpcsxLib.overlayPadData(port, digital1, digital2, leftStickX,
                                  leftStickY, rightStickX, rightStickY);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_overlayPadPressure(
+    JNIEnv *env, jobject, jint port, jintArray values) {
+  // Absent on a core older than this export: the pad still works, every button
+  // is just digital, which is the behaviour that shipped before it existed.
+  if (rpcsxLib.overlayPadPressure == nullptr || values == nullptr) {
+    return false;
+  }
+
+  const jsize count = env->GetArrayLength(values);
+  if (count <= 0) {
+    return false;
+  }
+
+  // Critical rather than a copy: this runs on every input event that moves a
+  // trigger, and the callee only reads the values before returning.
+  auto *elems = static_cast<jint *>(env->GetPrimitiveArrayCritical(values, nullptr));
+  if (elems == nullptr) {
+    return false;
+  }
+
+  static_assert(sizeof(jint) == sizeof(int),
+                "jint and int must match for the pressure array to be passed through");
+  const bool ok = rpcsxLib.overlayPadPressure(
+      port, reinterpret_cast<const int *>(elems), static_cast<int>(count));
+
+  env->ReleasePrimitiveArrayCritical(values, elems, JNI_ABORT);
+  return ok;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_initialize(
@@ -316,6 +365,18 @@ extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_resume(JNIEnv *env,
   return rpcsxLib.resume();
 }
 
+extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_pause(JNIEnv *env,
+                                                             jobject) {
+  // Same null guard as resume: the core is dlopen()ed separately and may not be
+  // up yet. A missing symbol also means an older core, so an app built against
+  // this cannot assume the export is there.
+  if (rpcsxLib.pause == nullptr) {
+      return;
+  }
+
+  return rpcsxLib.pause();
+}
+
 extern "C" JNIEXPORT void JNICALL Java_net_rpcsx_RPCSX_openHomeMenu(JNIEnv *env,
                                                                     jobject) {
   // The core is dlopen()ed separately and may not be up yet -- during
@@ -338,6 +399,21 @@ Java_net_rpcsx_RPCSX_getTitleId(JNIEnv *env, jobject) {
   }
 
   return wrap(env, rpcsxLib.getTitleId());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_getCurrentTrophyName(JNIEnv *env, jobject) {
+  // The core is dlopen()ed separately and may not be up yet -- during
+  // onboarding, or if it failed to load. Calling through a null pointer
+  // is an instant SIGSEGV, so fail the call instead.
+  //
+  // Also null on an OLDER core that predates this export, since it is resolved
+  // by dlsym: the frontend must treat null as "unknown", not as "no trophies".
+  if (rpcsxLib.getCurrentTrophyName == nullptr) {
+      return nullptr;
+  }
+
+  return wrap(env, rpcsxLib.getCurrentTrophyName());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_net_rpcsx_RPCSX_surfaceEvent(
@@ -544,6 +620,26 @@ Java_net_rpcsx_RPCSX_supportsCustomDriverLoading(JNIEnv *env,
   return access("/dev/kgsl-3d0", F_OK) == 0;
 }
 
+// Force the Adreno GPU to its maximum clocks, or release it back to normal scaling.
+//
+// Adreno's DVFS ramps clocks up only after it has already seen load, so a scene that suddenly
+// becomes GPU-bound stutters through the ramp every time it happens. Pinning the clocks removes
+// that at the cost of heat and battery, which is why it is opt-in rather than a default.
+//
+// Nothing here talks to the emulator core: adrenotools is linked into this JNI library, and
+// adrenotools_set_turbo opens /dev/kgsl-3d0 itself and silently does nothing on non-Adreno
+// hardware or if the open fails. So it is safe to call unconditionally, including before the core
+// is loaded. Ported from the RPCSX Android fork, which ships it default-off; kept default-off here
+// for the same reason.
+extern "C" JNIEXPORT void JNICALL
+Java_net_rpcsx_RPCSX_setGpuTurbo(JNIEnv *, jobject, jboolean on) {
+#if defined(__aarch64__)
+  adrenotools_set_turbo(on == JNI_TRUE);
+#else
+  (void) on;
+#endif
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_net_rpcsx_RPCSX_getVersion(JNIEnv *env, jobject) {
   // The core is dlopen()ed separately and may not be up yet -- during
@@ -555,6 +651,145 @@ Java_net_rpcsx_RPCSX_getVersion(JNIEnv *env, jobject) {
 
   return wrap(env, rpcsxLib.getVersion());
 }
+
+#if defined(__aarch64__)
+// Why a driver will not load, when the answer is knowable before trying.
+//
+// A community driver built against a newer NDK imports symbols versioned against a libc
+// this device does not have, and the linker then refuses it. adrenotools reports that to
+// logcat and quietly substitutes the system driver, so from the app's side the load
+// "succeeded" and the user runs a driver they did not choose.
+//
+// The requirement is stated in the file: DT_VERNEED / .gnu.version_r lists the libc
+// versions it needs, e.g. LIBC_36 for API 36. Comparing that against the running API
+// turns "failed to load" into the actual reason, which is the difference between a
+// usable bug report and a shrug. Mr Purple T29 needs LIBC_36 (Android 16) and its own
+// meta.json claims minApi 30, so the metadata cannot be trusted for this -- only the
+// binary can.
+//
+// Returns an empty string when nothing conclusive was found. Advisory only: the load is
+// still attempted, so a wrong answer here costs a log line and never a working driver.
+static std::string driver_libc_requirement_blocker(const std::string &soPath) {
+  std::FILE *f = std::fopen(soPath.c_str(), "rb");
+  if (f == nullptr) {
+    return {};
+  }
+
+  std::vector<char> data;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+
+  // Header tables live near the start and end; the symbol names they point at can be
+  // anywhere, so read the whole file. These are ~15-20 MB and read once per driver
+  // switch, not per boot.
+  if (size <= 0 || size > (256 << 20)) {
+    std::fclose(f);
+    return {};
+  }
+
+  std::fseek(f, 0, SEEK_SET);
+  data.resize(static_cast<size_t>(size));
+  const size_t got = std::fread(data.data(), 1, data.size(), f);
+  std::fclose(f);
+
+  if (got != data.size() || data.size() < sizeof(Elf64_Ehdr)) {
+    return {};
+  }
+
+  const auto *ehdr = reinterpret_cast<const Elf64_Ehdr *>(data.data());
+
+  if (std::memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+      ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_shoff == 0 ||
+      ehdr->e_shentsize != sizeof(Elf64_Shdr)) {
+    return {};
+  }
+
+  // Section headers rather than PT_DYNAMIC: they carry file offsets directly, so no
+  // vaddr-to-offset mapping is needed. Shared objects keep them; if they are gone, this
+  // check simply declines to answer.
+  const auto section_at = [&](size_t i) -> const Elf64_Shdr * {
+    const size_t off = ehdr->e_shoff + i * sizeof(Elf64_Shdr);
+    if (off + sizeof(Elf64_Shdr) > data.size()) {
+      return nullptr;
+    }
+    return reinterpret_cast<const Elf64_Shdr *>(data.data() + off);
+  };
+
+  for (size_t i = 0; i < ehdr->e_shnum; i++) {
+    const Elf64_Shdr *sh = section_at(i);
+
+    if (sh == nullptr || sh->sh_type != SHT_GNU_verneed) {
+      continue;
+    }
+
+    const Elf64_Shdr *strtab = section_at(sh->sh_link);
+
+    if (strtab == nullptr || strtab->sh_offset >= data.size()) {
+      return {};
+    }
+
+    const char *strings = data.data() + strtab->sh_offset;
+    const size_t strings_max = data.size() - strtab->sh_offset;
+
+    size_t offset = sh->sh_offset;
+    int highest_libc = 0;
+
+    for (size_t entry = 0; entry < sh->sh_info; entry++) {
+      if (offset + sizeof(Elf64_Verneed) > data.size()) {
+        break;
+      }
+
+      const auto *vn = reinterpret_cast<const Elf64_Verneed *>(data.data() + offset);
+      size_t aux_offset = offset + vn->vn_aux;
+
+      for (size_t aux = 0; aux < vn->vn_cnt; aux++) {
+        if (aux_offset + sizeof(Elf64_Vernaux) > data.size()) {
+          break;
+        }
+
+        const auto *vna = reinterpret_cast<const Elf64_Vernaux *>(data.data() + aux_offset);
+
+        if (vna->vna_name < strings_max) {
+          const char *name = strings + vna->vna_name;
+          int level = 0;
+
+          // Only LIBC_<n> is a device-capability statement. Anything else (LIBC,
+          // LIBC_PRIVATE, other sonames) says nothing about the API level.
+          if (std::sscanf(name, "LIBC_%d", &level) == 1 && level > highest_libc) {
+            highest_libc = level;
+          }
+        }
+
+        if (vna->vna_next == 0) {
+          break;
+        }
+
+        aux_offset += vna->vna_next;
+      }
+
+      if (vn->vn_next == 0) {
+        break;
+      }
+
+      offset += vn->vn_next;
+    }
+
+    const int device_api = android_get_device_api_level();
+
+    if (highest_libc > 0 && device_api > 0 && highest_libc > device_api) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "it requires LIBC_%d (Android API %d) but this device provides API %d",
+                    highest_libc, highest_libc, device_api);
+      return buf;
+    }
+
+    return {};
+  }
+
+  return {};
+}
+#endif // __aarch64__
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
@@ -573,6 +808,26 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
       __android_log_print(ANDROID_LOG_INFO, "RPCSX-UI", "Loading custom driver %s",
                           path.c_str());
 
+      // Said before the attempt, because adrenotools swallows the failure: it logs to
+      // logcat and hands back the system driver, so the caller cannot tell a real load
+      // from a substitution, and the reason never reaches the emulator log at all.
+      if (auto blocker = driver_libc_requirement_blocker(path + "/" + libraryName);
+          !blocker.empty()) {
+        const std::string report =
+            "Custom driver '" + libraryName + "' cannot load on this device: " + blocker +
+            ". It was built against a newer NDK than this Android version supports; the "
+            "driver's own metadata does not carry this. The system driver will be used "
+            "instead.";
+
+        __android_log_print(ANDROID_LOG_ERROR, "RPCSX-UI", "%s", report.c_str());
+
+        // Also to the emulator log, which is the file that gets attached to issues.
+        // logcat alone means the reason exists and no report ever contains it.
+        if (rpcsxLib.reportDriverProblem != nullptr) {
+          rpcsxLib.reportDriverProblem(report);
+        }
+      }
+
       ::dlerror();
       loader = adrenotools_open_libvulkan(
               RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, (hookDir + "/").c_str(),
@@ -586,10 +841,27 @@ Java_net_rpcsx_RPCSX_setCustomDriver(JNIEnv *env, jobject, jstring jpath,
       }
   }
 
-  auto prevLoader = rpcsxLib.setCustomDriver(loader);
-  if (prevLoader != nullptr) {
-    ::dlclose(prevLoader);
-  }
+  // Deliberately NOT dlclose()ing the previous handle.
+  //
+  // A Vulkan driver cannot be unloaded while anything resolved out of it is still reachable, and
+  // from here there is no way to know that. VMA caches vkGetPhysicalDeviceMemoryProperties2 in the
+  // allocator at creation time, so the address lives inside the driver library for as long as the
+  // renderer does.
+  //
+  // Restart is the one flow where a start races a teardown that has not finished:
+  // applyRendererPrefs() re-applies the driver on EVERY start, so it dlopen'd a new handle and
+  // closed the old one while the previous VKGSRender was still unwinding. Its destructor then
+  // freed its data heaps, VMA went to refresh its budget, and called through a pointer into a
+  // library that was no longer mapped -- "Segfault executing location <addr> at <addr>", inside
+  // VmaAllocator_T::UpdateVulkanBudget. The give-away was the fault address landing on the same
+  // offset every time with a different base: a live function in an unmapped library, not a
+  // corrupted pointer. That is the "Restart crashes the app" report, and the same for
+  // apply-and-restart after picking a driver.
+  //
+  // Leaking one handle per driver SWITCH is the cheap side of this trade: it is bounded by how
+  // many times a user changes driver in a session, the mapping is shared, and dlclose on an ICD
+  // is not something the loader promises to honour anyway.
+  rpcsxLib.setCustomDriver(loader);
 
   return true;
 #else
@@ -663,6 +935,17 @@ Java_net_rpcsx_RPCSX_hasStateInSlot(JNIEnv *, jobject, jint slot) {
 // Patches
 // ---------------------------------------------------------------------------
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_rpcsx_RPCSX_patchEngineVersion(JNIEnv *env, jobject) {
+  // Empty rather than a guessed version: the caller asks precisely because it
+  // must not name a schema version of its own.
+  if (rpcsxLib.patchEngineVersion == nullptr) {
+    return wrap(env, "");
+  }
+
+  return wrap(env, rpcsxLib.patchEngineVersion());
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_net_rpcsx_RPCSX_patchesImport(JNIEnv *env, jobject, jstring jcontent) {
   if (rpcsxLib.patchesImport == nullptr) {
@@ -701,4 +984,30 @@ Java_net_rpcsx_RPCSX_patchSetEnabled(JNIEnv *env, jobject, jstring jhash,
   return rpcsxLib.patchSetEnabled(unwrap(env, jhash), unwrap(env, jdescription),
                                   unwrap(env, jserial),
                                   unwrap(env, jappVersion), enabled);
+}
+
+// ADPF telemetry. All three return 0 when unmeasured or on a core too old to export them,
+// and the Kotlin side treats 0 as "skip this update" rather than feeding the OS a bogus hint.
+extern "C" JNIEXPORT jlong JNICALL
+Java_net_rpcsx_RPCSX_getFramePeriodNs(JNIEnv *, jobject) {
+  if (rpcsxLib.getFramePeriodNs == nullptr) {
+    return 0;
+  }
+  return static_cast<jlong>(rpcsxLib.getFramePeriodNs());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_net_rpcsx_RPCSX_getFrameWorkNs(JNIEnv *, jobject) {
+  if (rpcsxLib.getFrameWorkNs == nullptr) {
+    return 0;
+  }
+  return static_cast<jlong>(rpcsxLib.getFrameWorkNs());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_net_rpcsx_RPCSX_getRsxThreadTid(JNIEnv *, jobject) {
+  if (rpcsxLib.getRsxThreadTid == nullptr) {
+    return 0;
+  }
+  return static_cast<jint>(rpcsxLib.getRsxThreadTid());
 }

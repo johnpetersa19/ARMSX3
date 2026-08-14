@@ -373,6 +373,7 @@ private fun MenuPage(
                     EmulationMenuTab.Controls -> ControlsPane(state, viewModel)
                     EmulationMenuTab.Options -> OptionsPane(state, viewModel)
                     EmulationMenuTab.Achievements -> AchievementsPane(state, viewModel)
+                    EmulationMenuTab.Trophies -> TrophiesPane(viewModel)
                 }
             }
         }
@@ -513,6 +514,9 @@ private fun tabGlyph(tab: EmulationMenuTab): String = when (tab) {
     EmulationMenuTab.Controls -> "🎮"
     EmulationMenuTab.Options -> "⚙"
     EmulationMenuTab.Achievements -> "🏆"
+    // The trophy cup, same glyph the library drawer's Trophies row uses. It does not collide
+    // with the RA tab above because that one is filtered out of the rail on ARMSX3.
+    EmulationMenuTab.Trophies -> "🏆"
 }
 
 @Composable
@@ -655,6 +659,17 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
         // "tap to reveal", NOT show/hide: on = the glyph stays hidden until you tap its top-right
         // corner, which surfaces it. Either way that corner always opens this menu, so unlike the
         // old on/off toggle there's no setting here that can lock you out of it.
+        //
+        // The comment above outlived its control: the row was lost somewhere in the port and the
+        // setting was left with no writer at all, so the glyph could not be hidden or brought back
+        // by anyone. Reported as the option missing from this menu, which is exactly what it was.
+        MenuSwitchRow(
+            str("overlay.pauseTapReveal.label"),
+            com.armsx2.ui.touch.TouchControls.pauseTapToReveal.value,
+            description = str("overlay.pauseTapReveal.desc"),
+        ) { v ->
+            com.armsx2.ui.touch.TouchControls.setPauseTapToReveal(v)
+        }
     // Removed: PS2 per-primitive filtering; use Anisotropic Filtering.
         Spacer(Modifier.height(6.dp))
         // OSD mode selector — one control (Full / Minimal / Custom / Off) in place of the old
@@ -862,6 +877,14 @@ private fun GraphicsPane(state: EmulationMenuUiState, viewModel: EmulationMenuVi
         MenuSwitchRow(str("renderer.readColorBuffers.label"), settings.ps3.readColorBuffers) { v ->
             viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(readColorBuffers = v)) }
         }
+        Spacer(Modifier.height(6.dp))
+        // GPU Turbo in-game: the whole point is A/B-ing it against a scene that is actually
+        // stuttering, which is impossible if you have to quit to Settings to flip it. Applied
+        // live, not just at the next renderer start.
+        MenuSwitchRow(str("renderer.gpuTurbo.label"), settings.ps3.gpuTurbo) { v ->
+            viewModel.updateSettings { it.copy(ps3 = it.ps3.copy(gpuTurbo = v)) }
+            runCatching { net.rpcsx.RPCSX.instance.setGpuTurbo(v) }
+        }
     // Overlay artwork, switchable from in-game — trying bezels means seeing them ON the game, and
     // having to leave for All Settings each time made that unusable. Import still lives in the
     // settings tab (it opens a file picker); this is the picker for what is already imported.
@@ -956,7 +979,12 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
     }
     HorizontalOptions(
         title = str("perf.displayFpsCap.label"),
-        options = listOf(0, 20, 30, 45, 60, 90, 120).map {
+        // 90 and 120 removed: neither can take effect. RPCS3 caps the presented rate at the
+        // Frame limit enum, which tops out at 60 for anything the PS3 outputs, so a Second Frame
+        // Limit above that loses the min() at RSXThread.cpp:3676 and the rate stays 60. Offering
+        // them just invited "the cap does nothing" reports for the two values where that is true
+        // by construction. (Measured: second=90.00 -> limit=60.00.)
+        options = listOf(0, 20, 30, 45, 60).map {
             it to if (it == 0) str("setup.toggle.off") else "$it FPS"
         },
         selected = settings.fpsLimit,
@@ -1281,6 +1309,79 @@ private fun AchievementsPane(state: EmulationMenuUiState, viewModel: EmulationMe
     // screen (it's still available via the button above).
     state.achievements.forEach { item -> InGameAchievementRow(item) }
 }
+
+/**
+ * The running game's PS3 trophies. RPCS3's own data, not RetroAchievements.
+ *
+ * The rows are [com.armsx2.ui.trophies.TrophyRow] — the SAME composable the library's Trophies
+ * screen uses, not a copy — so the two lists cannot drift apart. Scoping is
+ * TrophyRepository.loadCurrentGame(), which asks the core for its `current_trophy_name`.
+ *
+ * Its ViewModel is keyed apart from the library screen's so the two do not fight over one
+ * instance: this pane and the full in-game screen deliberately SHARE that keyed instance, so
+ * opening the full list reuses what the pane already loaded instead of rescanning.
+ */
+@Composable
+private fun TrophiesPane(viewModel: EmulationMenuViewModel) {
+    val trophies: com.armsx2.ui.trophies.TrophiesViewModel =
+        androidx.lifecycle.viewmodel.compose.viewModel(key = InGameTrophiesVmKey)
+    val state = trophies.state.value
+    // Re-read on every entry to the tab: a trophy can unlock while the game is running, and the
+    // set itself only appears once the game creates its trophy context.
+    LaunchedEffect(Unit) { trophies.refresh(currentGameOnly = true) }
+
+    val game = state.games.firstOrNull()
+
+    CompactAction(
+        str("trophies.viewTrophies"),
+        "🏆",
+        Modifier.fillMaxWidth(),
+        viewModel::openTrophies,
+    )
+    Spacer(Modifier.height(4.dp))
+
+    SectionCard(str("trophies.title")) {
+        when {
+            state.loading && game == null -> Text(
+                str("trophies.loading"),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // Most PS3 games have no trophy set at all, and plenty of those that do only
+            // register it once you reach a menu — so this is an ordinary state, not an error.
+            game == null -> Text(
+                str("trophies.none.body"),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            else -> {
+                Text(
+                    game.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    com.armsx2.i18n.I18n.get("trophies.progress")
+                        .replace("%1", game.unlocked.toString())
+                        .replace("%2", game.total.toString())
+                        .replace("%3", game.percent.toString()),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+
+    // Inline list, mirroring the RA pane: the gateway above is still there for the full screen
+    // (with the show-hidden toggle), but the common case is a glance at what is left.
+    game?.let { set ->
+        trophies.visibleTrophies(set).forEach { com.armsx2.ui.trophies.TrophyRow(it) }
+    }
+}
+
+/** Shared ViewModel key for the two in-game trophy surfaces (this pane and the full screen). */
+internal const val InGameTrophiesVmKey = "trophies-ingame"
 
 @Composable
 private fun InGameAchievementRow(item: AchievementItem) {

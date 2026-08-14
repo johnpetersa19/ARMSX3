@@ -104,6 +104,7 @@ namespace vk
 			bool debug_utils = false;
 			bool external_memory_host = false;
 			bool framebuffer_loops = false;
+			bool memory_budget = false;
 			bool shader_stencil_export = false;
 			bool surface_capabilities_2 = false;
 			bool synchronization_2 = false;
@@ -171,6 +172,18 @@ namespace vk
 		VkQueue m_present_queue = VK_NULL_HANDLE;
 		VkQueue m_transfer_queue = VK_NULL_HANDLE;
 
+		// Driver pipeline cache (SPIR-V -> ISA). RPCS3's own shader_cache only avoids
+		// re-GENERATING SPIR-V; without this the driver still re-runs its backend compile
+		// for every pipeline on every cold boot. VK_NULL_HANDLE on any failure, which is
+		// exactly what the create calls passed before, so every path stays safe.
+		VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
+		// Last serialized size, so an unchanged cache skips the file write entirely.
+		mutable usz m_pipeline_cache_saved_size = 0;
+
+		std::string get_pipeline_cache_path() const;
+		void load_pipeline_cache();
+		void save_and_destroy_pipeline_cache();
+
 		u32 m_graphics_queue_family = 0;
 		u32 m_present_queue_family = 0;
 		u32 m_transfer_queue_family = 0;
@@ -219,6 +232,7 @@ namespace vk
 		bool get_conditional_render_support() const { return pgpu->optional_features_support.conditional_rendering; }
 		bool get_unrestricted_depth_range_support() const { return pgpu->optional_features_support.unrestricted_depth_range; }
 		bool get_external_memory_host_support() const { return pgpu->optional_features_support.external_memory_host; }
+		bool get_memory_budget_support() const { return pgpu->optional_features_support.memory_budget; }
 		bool get_surface_capabilities_2_support() const { return pgpu->optional_features_support.surface_capabilities_2; }
 		bool get_debug_utils_support() const { return g_cfg.video.renderdoc_compatiblity && pgpu->optional_features_support.debug_utils; }
 		bool get_framebuffer_loops_support() const { return pgpu->optional_features_support.framebuffer_loops; }
@@ -238,6 +252,13 @@ namespace vk
 		u32 get_transfer_queue_family() const { return m_transfer_queue_family; }
 
 		mem_allocator_base* get_allocator() const { return m_allocator.get(); }
+
+		// May legitimately be VK_NULL_HANDLE (unavailable or failed), which is the value
+		// the create calls used before this existed, so it is always safe to pass on.
+		VkPipelineCache get_pipeline_cache() const { return m_pipeline_cache; }
+
+		// Serialize without destroying, for the periodic mid-session save.
+		void save_pipeline_cache() const;
 
 		operator VkDevice() const { return dev; }
 	};

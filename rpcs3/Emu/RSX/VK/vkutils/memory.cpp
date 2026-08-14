@@ -14,6 +14,11 @@ namespace
 
 namespace vk
 {
+	// Defined in VKHelpers.cpp. Declared here rather than including VKHelpers.h, which pulls the
+	// renderer into vkutils and inverts the dependency this directory is kept clean of.
+	bool is_last_ditch_eviction();
+	void set_last_ditch_eviction(bool state);
+
 	memory_type_info::memory_type_info(u32 index, u64 size)
 	{
 		push(index, size);
@@ -197,6 +202,32 @@ namespace vk
 			allocatorInfo.pHeapSizeLimit = heap_limits.data();
 		}
 
+		// Ask the driver what it will actually give us, instead of assuming the heap
+		// (or our own cap) is available.
+		//
+		// get_memory_usage returns usage/budget, and every eviction decision upstream
+		// is a threshold on it: 75% picks safer allocation flags, 90% is severe, 95%
+		// is treated as fatal. Without this extension VMA has no budget to report, so
+		// it uses the heap size -- and where pHeapSizeLimit is set, that limit. On a
+		// phone the limit is a number we chose, not one the hardware promised, so the
+		// load reads far below the real ceiling and NONE of those thresholds are ever
+		// crossed. Observed on an Adreno 740: Ratchet & Clank died on a 32MB
+		// allocation at 516MB used against a 2048MB cap -- 25% load, severity "low",
+		// no eviction had run in the three minutes before it, and the first refusal
+		// from the driver killed the RSX thread outright.
+		//
+		// VMA takes the smaller of this budget and pHeapSizeLimit, so the cap still
+		// caps; it just stops being mistaken for headroom that exists.
+		if (dev.get_memory_budget_support())
+		{
+			allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+		}
+		else
+		{
+			rsx_log.warning("VK_EXT_memory_budget is unavailable. Video memory pressure will be "
+				"judged against the heap size rather than what the driver will actually part with.");
+		}
+
 #ifdef __ANDROID__
 		// Android builds with VK_NO_PROTOTYPES so the driver behind every vkFoo
 		// can be swapped (adrenotools). That also switches VMA from its static
@@ -309,6 +340,49 @@ namespace vk
 		if (!request.throw_on_fail)
 		{
 			return VK_NULL_HANDLE;
+		}
+
+		// Last chance before killing the thread: evict as if this were fatal, because it is.
+		//
+		// The attempt above asks at 'severe' when the caller can throw, and severe is also as far
+		// as on_vram_exhausted will go while the RSX is uninterruptible -- it deliberately
+		// declines the hard sync there, since eviction would touch resources the driver may still
+		// be reading. That is the right call while there is still a way out. There is not one
+		// here: the next statement ends the RSX thread, which the user sees as the picture
+		// freezing while audio keeps playing, so a sync that might disturb in-flight resources is
+		// strictly the cheaper risk.
+		//
+		// Ratchet & Clank reaches this asking for a single 84MB block while holding 472MB of a
+		// 2048MB cap, so what fails is one large request rather than a full heap -- exactly the
+		// case where dropping everything unlocked can still find room.
+		//
+		// Guarded on recover_vmem_on_fail like the attempt above, so a caller that opted out of
+		// recovery is not handed it here by the back door.
+		const bool last_ditch_recovered = [&]()
+		{
+			if (!request.recover_vmem_on_fail || error_code != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+			{
+				return false;
+			}
+
+			// Scoped, so the exemption cannot outlive this attempt and quietly authorise a hard
+			// sync somewhere it is not warranted.
+			vk::set_last_ditch_eviction(true);
+			const bool relieved = vmm_handle_memory_pressure(rsx::problem_severity::fatal);
+			vk::set_last_ditch_eviction(false);
+			return relieved;
+		}();
+
+		if (last_ditch_recovered)
+		{
+			const auto [status, type] = do_vma_alloc();
+			if (status == VK_SUCCESS)
+			{
+				rsx_log.error("Renderer ran out of video memory and recovered only by evicting everything it could. "
+					"A visual glitch here is expected, and is the alternative to the renderer dying.");
+				vmm_notify_memory_allocated(vma_alloc, type, request.size, request.pool);
+				return vma_alloc;
+			}
 		}
 
 		// Say what could not be allocated before dying.
@@ -514,8 +588,35 @@ namespace vk
 
 	memory_block::~memory_block()
 	{
+		// DIAGNOSTIC (restart crash): m_mem_allocator is BORROWED -- cached from
+		// get_current_mem_allocator() at construction and freed through here, with nothing tying
+		// its lifetime to the allocator's. Pressing Restart faults inside
+		// VmaAllocator_T::UpdateVulkanBudget reached from this free(), jumping through a garbage
+		// function pointer, which is what reading a dead VmaAllocator_T looks like.
+		//
+		// Everything that would explain it by ordering has been checked and does not: the heaps are
+		// freed at VKGSRender.cpp:879 while the device is not destroyed until :926, there is exactly
+		// one swapchain->destroy() caller, and data_heap_manager::reset() clears its set. So compare
+		// the allocator this block was built against with the one that is current now: if they
+		// differ, the block outlived its allocator and this names it.
 		if (m_mem_allocator && m_mem_handle)
 		{
+			// Not get_current_mem_allocator(): that dereferences g_render_device unconditionally,
+			// and a teardown where the device pointer is already gone is precisely the state being
+			// investigated -- the diagnostic must not be the thing that crashes.
+			const auto current = g_render_device ? g_render_device->get_allocator() : nullptr;
+
+			if (current != m_mem_allocator)
+			{
+				rsx_log.error("[memblock] allocator changed under a live block: built=%p now=%p size=%llu -- skipping free",
+					static_cast<const void*>(m_mem_allocator), static_cast<const void*>(current), m_size);
+
+				// Freeing through the stale pointer is the crash. The device that owned this memory
+				// is going away regardless, and vkDestroyDevice releases its allocations, so
+				// declining to free here loses nothing that is not already lost.
+				return;
+			}
+
 			m_mem_allocator->free(m_mem_handle);
 		}
 	}

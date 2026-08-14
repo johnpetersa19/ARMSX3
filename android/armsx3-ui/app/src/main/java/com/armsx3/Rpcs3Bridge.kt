@@ -265,9 +265,13 @@ object Rpcs3Bridge {
 
     @JvmStatic
     fun pause() {
-        // RPCS3 has no explicit pause entry point; the home menu overlay owns
-        // pause/resume. Track intent so vmSetPaused round-trips.
+        // This used to set `paused` and stop there, on the belief that RPCS3 has no explicit pause
+        // entry point. It does -- Emu.Pause() -- and the core has always called it on surface loss,
+        // which is why BACKGROUNDING the app was the only thing that actually paused while the
+        // in-game pause menu left the game running underneath it. resume() reached the core and
+        // pause() did not, so the pair was asymmetric and "Pause" was decorative.
         paused = true
+        RPCSX.instance.pause()
     }
 
     @JvmStatic
@@ -288,7 +292,36 @@ object Rpcs3Bridge {
         stopRequested = true
         runCatching { RPCSX.instance.kill() }
         resetPadState()
+
+        // Then WAIT for the core to actually be stopped, because kill() does not guarantee it.
+        //
+        // Restart is where that mattered: stop() ran this, it returned with the emulator still
+        // reporting a live VM (logged as "shutdown_return active=true runLoop=true state=RUNNING"),
+        // the run loop's finally then started the replacement VM -- and the teardown this kill()
+        // had set in motion finished afterwards and took the NEW VM down with it. The log showed
+        // two BootGame calls and then "Unloading ISO / Quit with main_window::closeEvent", after
+        // which the restart flag was already spent, so the app fell through to the return-to-library
+        // branch. That is the "Restart kicks you back to the library" report.
+        //
+        // Bounded, and deliberately so: a core that never returns to Stopped is a real state (see
+        // the second loop in boot() for the same hazard), and a stop that gives up after a few
+        // seconds is far better than one that hangs the app forever.
+        var waited = 0L
+        while (RPCSX.getState() != EmulatorState.Stopped && waited < SHUTDOWN_SETTLE_TIMEOUT_MS) {
+            Thread.sleep(POLL_INTERVAL_MS)
+            waited += POLL_INTERVAL_MS
+        }
+
+        if (RPCSX.getState() != EmulatorState.Stopped) {
+            android.util.Log.w(
+                "ARMSX3-VM",
+                "shutdown: core still ${RPCSX.getState()} after ${waited}ms; proceeding anyway",
+            )
+        }
     }
+
+    /** How long shutdown() waits for the core to report Stopped before giving up. */
+    private const val SHUTDOWN_SETTLE_TIMEOUT_MS = 8_000L
 
     @Volatile
     private var paused = false
@@ -374,10 +407,9 @@ object Rpcs3Bridge {
                     Rpcs3Settings.setStretchToDisplay(value == "Stretch")
                     Rpcs3Settings.setAspectRatio(value != "4:3")
                 }
-                "FrameLimitEnable" ->
-                    // "Auto" is RPCS3's per-title native pacing -- the right
-                    // meaning of "limit on" for a console that isn't fixed at 60.
-                    Rpcs3Settings.setFrameLimitMode(if (asBool(value)) "Auto" else "Off")
+                // Defers to the explicit FPS cap rather than forcing "Auto" over it; see
+                // Rpcs3Settings.setFrameLimitEnabled for why that mattered.
+                "FrameLimitEnable" -> Rpcs3Settings.setFrameLimitEnabled(asBool(value))
                 "VsyncEnable" -> Rpcs3Settings.setVsync(asBool(value))
                 // PCSX2's "skip duplicate frames" means "do not present a frame identical to
                 // the last one". It is harmless there and on by default, which is why Settings
@@ -537,6 +569,7 @@ object Rpcs3Bridge {
                 "Enable Buffering" -> Rpcs3Settings.setAudioBuffering(asBool(value))
                 "Desired Audio Buffer Duration" -> Rpcs3Settings.setAudioBufferDuration(asInt(value))
                 "Renderer" -> Rpcs3Settings.setAudioRenderer(asInt(value))
+                "Cubeb Backend" -> Rpcs3Settings.setCubebBackend(asInt(value))
                 else -> return false
             }
 
@@ -552,6 +585,11 @@ object Rpcs3Bridge {
                 "Body Background (hex)" -> Rpcs3Settings.setOverlayBodyBackground(value)
                 "Title Color (hex)" -> Rpcs3Settings.setOverlayTitleColor(value)
                 "Title Background (hex)" -> Rpcs3Settings.setOverlayTitleBackground(value)
+                else -> return false
+            }
+
+            "PS3/Misc" -> when (key) {
+                "Silence All Logs" -> Rpcs3Settings.setSilenceAllLogs(asBool(value))
                 else -> return false
             }
 
@@ -770,6 +808,14 @@ object Rpcs3Bridge {
         /** [lsUp, lsRight, lsDown, lsLeft, rsUp, rsRight, rsDown, rsLeft], 0f..1f. */
         val dir = FloatArray(8)
 
+        /** Analog pressure per pressure-capable button, in CELL_PAD press-offset
+         *  order, 1..255, or 0 for "leave this one digital". See [PRESSURE_SLOT]. */
+        val pressure = IntArray(PRESSURE_SLOTS)
+
+        /** Last array actually pushed, so an all-digital pad does not send one
+         *  JNI call per input event for values that never change. */
+        val pressureSent = IntArray(PRESSURE_SLOTS)
+
         /** Opposing directions cancel; 128 is centre, matching CELL_PAD. */
         private fun axis(pos: Int, neg: Int) =
             (128f + (dir[pos] - dir[neg]) * 127f).toInt().coerceIn(0, 255)
@@ -783,6 +829,10 @@ object Rpcs3Bridge {
             digital1 = 0
             digital2 = 0
             dir.fill(0f)
+            pressure.fill(0)
+            // NOT pressureSent: it tracks what the core currently holds, and the
+            // core is not reset here. Clearing it would skip the push that tells
+            // the core to drop a pressure left applied from before the reset.
         }
     }
 
@@ -874,6 +924,20 @@ object Rpcs3Bridge {
             }
         } else {
             applyButton(pad, index, pressed)
+
+            // `range` was dropped here for every non-stick button, so a physical
+            // trigger and the touch overlay's pressure modifier both arrived with
+            // a magnitude that nothing ever read: the button was pressed or it was
+            // not. Same "range 0 means a full press" convention as the stick rows
+            // above, so a plain digital press still reads as 255.
+            val pslot = PRESSURE_SLOT[index] ?: -1
+            if (pslot >= 0) {
+                pad.pressure[pslot] = when {
+                    !pressed -> 0
+                    range <= 0 -> 255
+                    else -> ((range / 32767f) * 255f).toInt().coerceIn(1, 255)
+                }
+            }
         }
         push(port)
     }
@@ -897,12 +961,42 @@ object Rpcs3Bridge {
     private fun push(port: Int) {
         val pad = pads.getOrNull(port) ?: return
         runCatching {
+            // Pressure first: overlayPadData is what writes each button's value, so
+            // it has to see the current pressure to apply it in the same push.
+            if (!pad.pressure.contentEquals(pad.pressureSent)) {
+                if (RPCSX.instance.overlayPadPressure(port, pad.pressure)) {
+                    pad.pressure.copyInto(pad.pressureSent)
+                }
+            }
             RPCSX.instance.overlayPadData(
                 port, pad.digital1, pad.digital2,
                 pad.leftX(), pad.leftY(), pad.rightX(), pad.rightY(),
             )
         }
     }
+
+    /**
+     * Android keycode -> its slot in [PadState.pressure], which is CELL_PAD press
+     * offset order (PRESS_RIGHT..PRESS_R2, contiguous in pad_types.h). Only the
+     * twelve buttons a PS3 pad reports pressure for; Select, Start, L3 and R3 have
+     * no press byte and are absent on purpose.
+     */
+    private val PRESSURE_SLOT: Map<Int, Int> = mapOf(
+        KeyEvent.KEYCODE_DPAD_RIGHT to 0,
+        KeyEvent.KEYCODE_DPAD_LEFT to 1,
+        KeyEvent.KEYCODE_DPAD_UP to 2,
+        KeyEvent.KEYCODE_DPAD_DOWN to 3,
+        KeyEvent.KEYCODE_BUTTON_Y to 4,   // triangle
+        KeyEvent.KEYCODE_BUTTON_B to 5,   // circle
+        KeyEvent.KEYCODE_BUTTON_A to 6,   // cross
+        KeyEvent.KEYCODE_BUTTON_X to 7,   // square
+        KeyEvent.KEYCODE_BUTTON_L1 to 8,
+        KeyEvent.KEYCODE_BUTTON_R1 to 9,
+        KeyEvent.KEYCODE_BUTTON_L2 to 10,
+        KeyEvent.KEYCODE_BUTTON_R2 to 11,
+    )
+
+    private const val PRESSURE_SLOTS = 12
 
     private fun resetPadState() {
         pads.forEach { it.reset() }
@@ -913,7 +1007,12 @@ object Rpcs3Bridge {
     // ---------------------------------------------------------------
 
     @JvmStatic
-    fun setAdpfEnabled(enabled: Boolean) { Unsupported.note("setAdpfEnabled") }
+    /** Drive PerformanceHintManager from the core's own frame timing. Was a no-op stub
+     *  inherited from the ARMSX2 UI port, so the settings toggle did nothing. */
+    fun setAdpfEnabled(enabled: Boolean) {
+        val ctx = com.armsx2.runtime.MainActivityRuntime.instance?.applicationContext ?: return
+        AdpfHinter.setEnabled(ctx, enabled)
+    }
     @JvmStatic
     fun setAffinityMode(mode: Int) { Unsupported.note("setAffinityMode") }
 

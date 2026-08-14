@@ -96,6 +96,7 @@ extern "C"
 	PFN_vkDestroyInstance vkDestroyInstance = nullptr;
 	PFN_vkDestroyPipeline vkDestroyPipeline = nullptr;
 	PFN_vkDestroyPipelineCache vkDestroyPipelineCache = nullptr;
+	PFN_vkGetPipelineCacheData vkGetPipelineCacheData = nullptr;
 	PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout = nullptr;
 	PFN_vkDestroyQueryPool vkDestroyQueryPool = nullptr;
 	PFN_vkDestroyRenderPass vkDestroyRenderPass = nullptr;
@@ -339,6 +340,8 @@ namespace vk::android
 			if (!vkDestroyPipeline) vkDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(dlsym(handle, "vkDestroyPipeline"));
 			vkDestroyPipelineCache = reinterpret_cast<PFN_vkDestroyPipelineCache>(vkGetInstanceProcAddr(nullptr, "vkDestroyPipelineCache"));
 			if (!vkDestroyPipelineCache) vkDestroyPipelineCache = reinterpret_cast<PFN_vkDestroyPipelineCache>(dlsym(handle, "vkDestroyPipelineCache"));
+			vkGetPipelineCacheData = reinterpret_cast<PFN_vkGetPipelineCacheData>(vkGetInstanceProcAddr(nullptr, "vkGetPipelineCacheData"));
+			if (!vkGetPipelineCacheData) vkGetPipelineCacheData = reinterpret_cast<PFN_vkGetPipelineCacheData>(dlsym(handle, "vkGetPipelineCacheData"));
 			vkDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(vkGetInstanceProcAddr(nullptr, "vkDestroyPipelineLayout"));
 			if (!vkDestroyPipelineLayout) vkDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(dlsym(handle, "vkDestroyPipelineLayout"));
 			vkDestroyQueryPool = reinterpret_cast<PFN_vkDestroyQueryPool>(vkGetInstanceProcAddr(nullptr, "vkDestroyQueryPool"));
@@ -532,6 +535,7 @@ namespace vk::android
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyInstance")) vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(p);
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyPipeline")) vkDestroyPipeline = reinterpret_cast<PFN_vkDestroyPipeline>(p);
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyPipelineCache")) vkDestroyPipelineCache = reinterpret_cast<PFN_vkDestroyPipelineCache>(p);
+		if (auto p = vkGetInstanceProcAddr(instance, "vkGetPipelineCacheData")) vkGetPipelineCacheData = reinterpret_cast<PFN_vkGetPipelineCacheData>(p);
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyPipelineLayout")) vkDestroyPipelineLayout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(p);
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyQueryPool")) vkDestroyQueryPool = reinterpret_cast<PFN_vkDestroyQueryPool>(p);
 		if (auto p = vkGetInstanceProcAddr(instance, "vkDestroyRenderPass")) vkDestroyRenderPass = reinterpret_cast<PFN_vkDestroyRenderPass>(p);
@@ -629,7 +633,12 @@ namespace vk::android
 		}
 
 		g_handle = handle;
-		vk_loader.success("Vulkan driver bound (%s)", g_custom ? "custom" : "system");
+
+		// "custom" describes the handle we were given, not necessarily the driver that
+		// answers through it: adrenotools falls back to the system driver inside that
+		// handle when its own dlopen fails, and says so only to logcat. The identity
+		// logged by physical_device::create is what actually answered.
+		vk_loader.success("Vulkan dispatch bound to the %s driver handle", g_custom ? "custom" : "system");
 		return previous;
 	}
 

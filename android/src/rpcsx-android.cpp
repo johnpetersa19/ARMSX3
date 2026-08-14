@@ -2,6 +2,7 @@
 #include "Crypto/unpkg.h"
 #include "Crypto/unself.h"
 #include "Emu/Audio/Cubeb/CubebBackend.h"
+#include "Emu/Audio/Oboe/OboeBackend.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/SPURecompiler.h"
@@ -18,6 +19,7 @@
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_save_dialog.h"
 #include "Emu/RSX/Overlays/overlay_trophy_notification.h"
+#include "Emu/RSX/Overlays/overlay_utils.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/GL/GLGSRender.h"
 #include "Emu/RSX/VK/VKGSRender.h"
@@ -123,6 +125,63 @@ static std::mutex g_virtual_pad_mutex;
 // could never address, so its input was assembled and then dropped.
 static std::array<std::shared_ptr<Pad>, CELL_PAD_MAX_PORT_NUM> g_virtual_pads;
 
+// Analog pressure for the twelve pressure-capable buttons, per port, 1..255.
+//
+// 0 means "nothing analog is driving this one, use the digital value". That is a
+// safe sentinel rather than a lost level: a button that is not pressed already
+// reports 0 below, so a pressed button whose pressure is 0 cannot occur, and the
+// zero-initialised array is exactly the pre-existing all-digital behaviour.
+//
+// Kept beside the pad rather than pushed through _rpcsx_overlayPadData because
+// that export's signature is frozen: the core is dlopen()ed and can be updated
+// independently of the JNI glue, so widening an existing export would make older
+// glue call it with a garbage argument. Glue that predates _rpcsx_overlayPadPressure
+// simply never calls it and every button keeps its old digital behaviour.
+//
+// Indexed by press offset minus CELL_PAD_BTN_OFFSET_PRESS_RIGHT, so the array
+// order is the one pad_types.h already defines (offsets 8..19, contiguous).
+inline constexpr int PRESSURE_COUNT =
+    CELL_PAD_BTN_OFFSET_PRESS_R2 - CELL_PAD_BTN_OFFSET_PRESS_RIGHT + 1;
+static std::array<std::array<std::atomic<int>, PRESSURE_COUNT>,
+                  CELL_PAD_MAX_PORT_NUM>
+    g_virtual_pad_pressure;
+
+// Digital button -> its press-value slot. The pairing is cellPad's own, from the
+// switch that copies m_value into output.button[CELL_PAD_BTN_OFFSET_PRESS_*].
+// Returns -1 for buttons the PS3 pad reports with no pressure (Select, Start,
+// L3, R3 and the PS button).
+static int pressure_index_for(u32 offset, u32 outKeyCode) {
+  const auto slot = [](int press_offset) {
+    return press_offset - CELL_PAD_BTN_OFFSET_PRESS_RIGHT;
+  };
+
+  if (offset == CELL_PAD_BTN_OFFSET_DIGITAL1) {
+    switch (outKeyCode) {
+    case CELL_PAD_CTRL_RIGHT: return slot(CELL_PAD_BTN_OFFSET_PRESS_RIGHT);
+    case CELL_PAD_CTRL_LEFT:  return slot(CELL_PAD_BTN_OFFSET_PRESS_LEFT);
+    case CELL_PAD_CTRL_UP:    return slot(CELL_PAD_BTN_OFFSET_PRESS_UP);
+    case CELL_PAD_CTRL_DOWN:  return slot(CELL_PAD_BTN_OFFSET_PRESS_DOWN);
+    default: return -1;
+    }
+  }
+
+  if (offset == CELL_PAD_BTN_OFFSET_DIGITAL2) {
+    switch (outKeyCode) {
+    case CELL_PAD_CTRL_TRIANGLE: return slot(CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE);
+    case CELL_PAD_CTRL_CIRCLE:   return slot(CELL_PAD_BTN_OFFSET_PRESS_CIRCLE);
+    case CELL_PAD_CTRL_CROSS:    return slot(CELL_PAD_BTN_OFFSET_PRESS_CROSS);
+    case CELL_PAD_CTRL_SQUARE:   return slot(CELL_PAD_BTN_OFFSET_PRESS_SQUARE);
+    case CELL_PAD_CTRL_L1:       return slot(CELL_PAD_BTN_OFFSET_PRESS_L1);
+    case CELL_PAD_CTRL_R1:       return slot(CELL_PAD_BTN_OFFSET_PRESS_R1);
+    case CELL_PAD_CTRL_L2:       return slot(CELL_PAD_BTN_OFFSET_PRESS_L2);
+    case CELL_PAD_CTRL_R2:       return slot(CELL_PAD_BTN_OFFSET_PRESS_R2);
+    default: return -1;
+    }
+  }
+
+  return -1;
+}
+
 std::string g_input_config_override;
 cfg_input_configurations g_cfg_input_configs;
 
@@ -166,6 +225,11 @@ static void pgo_flush()
 }
 #endif
 
+// Severity threshold for the logcat mirror. Defaults to warning: notice/trace still reach
+// RPCSX.log, they just stop costing a logd round trip each. Lower it at runtime when
+// actively debugging on a device.
+static std::atomic<int> g_logcat_min_level{static_cast<int>(logs::level::warning)};
+
 struct LogListener : logs::listener {
   LogListener() { logs::listener::add(this); }
 
@@ -199,10 +263,28 @@ struct LogListener : logs::listener {
       break;
     }
 
-    // text is a string_view now (upstream changed the listener signature) and
-    // string_view is not guaranteed null-terminated, so it cannot be handed
-    // straight to a C API.
-    __android_log_write(prio, "ARMSX3", std::string(text).c_str());
+    // Mirroring EVERY message to logcat is not free: each one is a heap allocation plus a
+    // SYNCHRONOUS IPC round trip to logd. A game that logs thousands of lines a second
+    // (LittleBigPlanet 2 does) then spends real frame time inside logd -- measured on device
+    // at 5-7 fps, which is why "silence all logs" appears to be a performance setting.
+    //
+    // It should not have to be. The FILE log is the artifact that gets attached to a bug
+    // report; logcat is a live-debugging convenience for whoever is holding the device. So
+    // mirror only what that person needs -- warnings and worse -- and let the rest go to the
+    // file alone, which is buffered and cheap. Nothing is lost from RPCSX.log.
+    //
+    // Severity is INVERTED in logs::level (always=0 .. trace=7), so '>' drops the noisy end.
+    if (static_cast<int>(static_cast<logs::level>(msg)) >
+        g_logcat_min_level.load(std::memory_order_relaxed)) {
+      return;
+    }
+
+    // text is a string_view (upstream changed the listener signature) and string_view is not
+    // guaranteed null-terminated, so it cannot go straight to a C API. Reuse a per-thread
+    // buffer rather than allocating a fresh std::string for every line.
+    thread_local std::string line;
+    line.assign(text);
+    __android_log_write(prio, "ARMSX3", line.c_str());
   }
 } static g_androidLogListener;
 
@@ -579,6 +661,15 @@ static FileType getFileType(const fs::file &file) {
 #define MAKE_STRING(id, x) [int(localized_string_id::id)] = {x, U##x}
 
 static std::pair<std::string, std::u32string> g_strings[] = {
+    MAKE_STRING(INVALID, "Invalid"),
+    MAKE_STRING(RSX_OVERLAYS_SPINNER_NO_TEXT, ""),
+    MAKE_STRING(RSX_OVERLAYS_TROPHY_BRONZE,
+                "You have earned a bronze trophy.\n%0"),
+    MAKE_STRING(RSX_OVERLAYS_TROPHY_SILVER,
+                "You have earned a silver trophy.\n%0"),
+    MAKE_STRING(RSX_OVERLAYS_TROPHY_GOLD, "You have earned a gold trophy.\n%0"),
+    MAKE_STRING(RSX_OVERLAYS_TROPHY_PLATINUM,
+                "You have earned a platinum trophy.\n%0"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS, "Compiling shaders"),
     MAKE_STRING(RSX_OVERLAYS_COMPILING_PPU_MODULES, "Compiling PPU Modules"),
     MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_YES, "Yes"),
@@ -603,6 +694,149 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(RSX_OVERLAYS_LIST_SELECT, "Enter"),
     MAKE_STRING(RSX_OVERLAYS_LIST_CANCEL, "Back"),
     MAKE_STRING(RSX_OVERLAYS_LIST_DENY, "Deny"),
+    MAKE_STRING(RSX_OVERLAYS_PRESSURE_INTENSITY_TOGGLED_OFF,
+                "Pressure intensity mode of player %0 disabled"),
+    MAKE_STRING(RSX_OVERLAYS_PRESSURE_INTENSITY_TOGGLED_ON,
+                "Pressure intensity mode of player %0 enabled"),
+    MAKE_STRING(RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_OFF,
+                "Analog limiter of player %0 disabled"),
+    MAKE_STRING(RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_ON,
+                "Analog limiter of player %0 enabled"),
+    MAKE_STRING(RSX_OVERLAYS_MOUSE_AND_KEYBOARD_EMULATED,
+                "Mouse and keyboard are now used as emulated devices."),
+    MAKE_STRING(RSX_OVERLAYS_MOUSE_AND_KEYBOARD_PAD,
+                "Mouse and keyboard are now used as pad."),
+    MAKE_STRING(
+        CELL_GAME_ERROR_BROKEN_GAMEDATA,
+        "ERROR: Game data is corrupted. The application will continue."),
+    MAKE_STRING(
+        CELL_GAME_ERROR_BROKEN_HDDGAME,
+        "ERROR: HDD boot game is corrupted. The application will continue."),
+    MAKE_STRING(
+        CELL_GAME_ERROR_BROKEN_EXIT_GAMEDATA,
+        "ERROR: Game data is corrupted. The application will be terminated."),
+    MAKE_STRING(CELL_GAME_ERROR_BROKEN_EXIT_HDDGAME,
+                "ERROR: HDD boot game is corrupted. The application will be "
+                "terminated."),
+    MAKE_STRING(CELL_GAME_ERROR_NOSPACE,
+                "ERROR: Not enough available space. The application will "
+                "continue.\nSpace needed: %0 KB"),
+    MAKE_STRING(CELL_GAME_ERROR_NOSPACE_EXIT,
+                "ERROR: Not enough available space. The application will be "
+                "terminated.\nSpace needed: %0 KB"),
+    MAKE_STRING(CELL_GAME_ERROR_DIR_NAME, "Directory name: %0"),
+    MAKE_STRING(CELL_GAME_DATA_EXIT_BROKEN,
+                "There has been an error!\n\nPlease remove the game data for "
+                "this title."),
+    MAKE_STRING(
+        CELL_HDD_GAME_EXIT_BROKEN,
+        "There has been an error!\n\nPlease reinstall the HDD boot game."),
+    MAKE_STRING(
+        CELL_HDD_GAME_CHECK_NOSPACE,
+        "Not enough space to create HDD boot game.\nSpace Needed: %0 KB"),
+    MAKE_STRING(CELL_HDD_GAME_CHECK_BROKEN, "HDD boot game %0 is corrupt!"),
+    MAKE_STRING(CELL_HDD_GAME_CHECK_NODATA,
+                "HDD boot game %0 could not be found!"),
+    MAKE_STRING(CELL_HDD_GAME_CHECK_INVALID, "Error: %0"),
+    MAKE_STRING(CELL_GAMEDATA_CHECK_NOSPACE,
+                "Not enough space to create game data.\nSpace Needed: %0 KB"),
+    MAKE_STRING(CELL_GAMEDATA_CHECK_BROKEN, "The game data in %0 is corrupt!"),
+    MAKE_STRING(CELL_GAMEDATA_CHECK_NODATA,
+                "The game data in %0 could not be found!"),
+    MAKE_STRING(CELL_GAMEDATA_CHECK_INVALID, "Error: %0"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_DEFAULT, "An error has occurred.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010001,
+                "The resource is temporarily unavailable.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010002,
+                "Invalid argument or flag.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010003,
+                "The feature is not yet implemented.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010004,
+                "Memory allocation failed.\n(%0)"),
+    MAKE_STRING(
+        CELL_MSG_DIALOG_ERROR_80010005,
+        "The resource with the specified identifier does not exist.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010006,
+                "The file does not exist.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010007,
+                "The file is in an unrecognized format / The file is not a "
+                "valid ELF file.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010008,
+                "Resource deadlock is avoided.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010009,
+                "Operation not permitted.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001000A,
+                "The device or resource is busy.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001000B,
+                "The operation is timed out.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001000C,
+                "The operation is aborted.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001000D, "Invalid memory access.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001000F,
+                "State of the target thread is invalid.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010010, "Alignment is invalid.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010011,
+                "Shortage of the kernel resources.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010012,
+                "The file is a directory.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010013, "Operation cancelled.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010014, "Entry already exists.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010015,
+                "Port is already connected.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010016, "Port is not connected.\n(%0)"),
+    MAKE_STRING(
+        CELL_MSG_DIALOG_ERROR_80010017,
+        "Failure in authorizing SELF. Program authentication fail.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010018, "The file is not MSELF.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010019, "System version error.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001A,
+                "Fatal system error occurred while authorizing SELF. SELF auth "
+                "failure.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001B, "Math domain violation.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001C, "Math range violation.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001D,
+                "Illegal multi-byte sequence in input.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001E, "File position error.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001001F,
+                "Syscall was interrupted.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010020, "File too large.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010021, "Too many links.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010022, "File table overflow.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010023,
+                "No space left on device.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010024, "Not a TTY.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010025, "Broken pipe.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010026, "Read-only filesystem.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010027, "Illegal seek.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010028, "Arg list too long.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010029, "Access violation.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002A,
+                "Invalid file descriptor.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002B,
+                "Filesystem mounting failed.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002C, "Too many files open.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002D, "No device.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002E, "Not a directory.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001002F, "No such device or IO.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010030,
+                "Cross-device link error.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010031, "Bad Message.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010032, "In progress.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010033, "Message size error.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010034, "Name too long.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010035, "No lock.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010036, "Not empty.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010037, "Not supported.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010038,
+                "File-system specific error.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_80010039, "Overflow occurred.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001003A,
+                "Filesystem not mounted.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001003B, "Not SData.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001003C,
+                "Incorrect version in sys_load_param.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001003D, "Pointer is null.\n(%0)"),
+    MAKE_STRING(CELL_MSG_DIALOG_ERROR_8001003E, "Pointer is null.\n(%0)"),
     MAKE_STRING(CELL_OSK_DIALOG_TITLE, "On Screen Keyboard"),
     MAKE_STRING(
         CELL_OSK_DIALOG_BUSY,
@@ -610,14 +844,28 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(CELL_SAVEDATA_CB_BROKEN, "Error - Save data corrupted"),
     MAKE_STRING(CELL_SAVEDATA_CB_FAILURE, "Error - Failed to save or load"),
     MAKE_STRING(CELL_SAVEDATA_CB_NO_DATA, "Error - Save data cannot be found"),
+    MAKE_STRING(CELL_SAVEDATA_CB_NO_SPACE,
+                "Error - Insufficient free space\n\nSpace needed: %0 KB"),
     MAKE_STRING(CELL_SAVEDATA_NO_DATA, "There is no saved data."),
     MAKE_STRING(CELL_SAVEDATA_NEW_SAVED_DATA_TITLE, "New Saved Data"),
     MAKE_STRING(CELL_SAVEDATA_NEW_SAVED_DATA_SUB_TITLE,
                 "Select to create a new entry"),
     MAKE_STRING(CELL_SAVEDATA_SAVE_CONFIRMATION,
                 "Do you want to save this data?"),
+    MAKE_STRING(CELL_SAVEDATA_DELETE_CONFIRMATION,
+                "Do you really want to delete this data?\n\n%0"),
+    MAKE_STRING(CELL_SAVEDATA_DELETE_SUCCESS,
+                "Successfully removed data!\n\n%0"),
+    MAKE_STRING(CELL_SAVEDATA_DELETE, "Delete this data?\n\n%0"),
+    MAKE_STRING(CELL_SAVEDATA_LOAD, "Load this data?\n\n%0"),
+    MAKE_STRING(CELL_SAVEDATA_OVERWRITE,
+                "Do you want to overwrite the saved data?\n\n%0"),
     MAKE_STRING(CELL_SAVEDATA_AUTOSAVE, "Saving..."),
     MAKE_STRING(CELL_SAVEDATA_AUTOLOAD, "Loading..."),
+    MAKE_STRING(CELL_CROSS_CONTROLLER_MSG,
+                "Start [%0] on the PS Vita system.\nIf you have not installed "
+                "[%0], go to [Remote Play] on the PS Vita system and start "
+                "[Cross-Controller] from the LiveArea™ screen."),
     MAKE_STRING(
         CELL_CROSS_CONTROLLER_FW_MSG,
         "If your system software version on the PS Vita system is earlier than "
@@ -630,12 +878,22 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_TITLE, "Select Message To Send"),
     MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_TITLE_INVITE, "Send Invite"),
     MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_TITLE_ADD_FRIEND, "Add Friend"),
+    MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION,
+                "Send message to %0 ?\n\nSubject:"),
+    MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION_INVITE,
+                "Send invite to %0 ?\n\nSubject:"),
+    MAKE_STRING(CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION_ADD_FRIEND,
+                "Send friend request to %0 ?\n\nSubject:"),
+    MAKE_STRING(CELL_NP_MESSAGE_INVITE_RECEIVED, "Received an invite from %0"),
+    MAKE_STRING(CELL_NP_MESSAGE_OTHER_RECEIVED, "Received a message from %0"),
     MAKE_STRING(RECORDING_ABORTED, "Recording aborted!"),
     MAKE_STRING(RPCN_NO_ERROR, "RPCN: No Error"),
     MAKE_STRING(RPCN_ERROR_INVALID_INPUT,
                 "RPCN: Invalid Input (Wrong Host/Port)"),
     MAKE_STRING(RPCN_ERROR_WOLFSSL, "RPCN Connection Error: WolfSSL Error"),
     MAKE_STRING(RPCN_ERROR_RESOLVE, "RPCN Connection Error: Resolve Error"),
+    MAKE_STRING(RPCN_ERROR_BINDING,
+                "RPCN Connection Error: Failed to bind to given binding IP"),
     MAKE_STRING(RPCN_ERROR_CONNECT, "RPCN Connection Error"),
     MAKE_STRING(RPCN_ERROR_LOGIN_ERROR,
                 "RPCN Login Error: Identification Error"),
@@ -649,11 +907,19 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "RPCN Misc Error: Protocol Version Error (outdated RPCS3?)"),
     MAKE_STRING(RPCN_ERROR_UNKNOWN, "RPCN: Unknown Error"),
     MAKE_STRING(RPCN_SUCCESS_LOGGED_ON, "Successfully logged on RPCN!"),
+    MAKE_STRING(RPCN_FRIEND_REQUEST_RECEIVED,
+                "RPCN: Received friend request: %0"),
+    MAKE_STRING(RPCN_FRIEND_ADDED, "RPCN: Friend added: %0"),
+    MAKE_STRING(RPCN_FRIEND_LOST, "RPCN: Friend removed: %0"),
+    MAKE_STRING(RPCN_FRIEND_LOGGED_IN, "RPCN: %0 logged in"),
+    MAKE_STRING(RPCN_FRIEND_LOGGED_OUT, "RPCN: %0 logged out"),
     MAKE_STRING(HOME_MENU_TITLE, "Home Menu"),
     MAKE_STRING(HOME_MENU_EXIT_GAME, "Exit Game"),
+    MAKE_STRING(HOME_MENU_RESTART, "Restart Game"),
     MAKE_STRING(HOME_MENU_RESUME, "Resume Game"),
     MAKE_STRING(HOME_MENU_FRIENDS, "Friends"),
     MAKE_STRING(HOME_MENU_FRIENDS_REQUESTS, "Pending Friend Requests"),
+    MAKE_STRING(HOME_MENU_FRIENDS_GAME_INVITES, "Game Invitations"),
     MAKE_STRING(HOME_MENU_FRIENDS_BLOCKED, "Blocked Users"),
     MAKE_STRING(HOME_MENU_FRIENDS_STATUS_ONLINE, "Online"),
     MAKE_STRING(HOME_MENU_FRIENDS_STATUS_OFFLINE, "Offline"),
@@ -661,15 +927,26 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(HOME_MENU_FRIENDS_REQUEST_SENT, "You sent a friend request"),
     MAKE_STRING(HOME_MENU_FRIENDS_REQUEST_RECEIVED,
                 "Sent you a friend request"),
+    MAKE_STRING(HOME_MENU_FRIENDS_BLOCK_USER_MSG, "Block this user?\n\n%0"),
+    MAKE_STRING(HOME_MENU_FRIENDS_UNBLOCK_USER_MSG, "Unblock this user?\n\n%0"),
+    MAKE_STRING(HOME_MENU_FRIENDS_REMOVE_USER_MSG, "Remove this user?\n\n%0"),
+    MAKE_STRING(HOME_MENU_FRIENDS_ACCEPT_REQUEST_MSG, "Accept Request?\n\n%0"),
+    MAKE_STRING(HOME_MENU_FRIENDS_CANCEL_REQUEST_MSG, "Cancel Request?\n\n%0"),
+    MAKE_STRING(HOME_MENU_FRIENDS_REJECT_REQUEST_MSG, "Reject Request?\n\n%0"),
     MAKE_STRING(HOME_MENU_FRIENDS_REJECT_REQUEST, "Reject Request"),
+    MAKE_STRING(HOME_MENU_FRIENDS_ACCEPT_GAME_INVITE_MSG,
+                "Accept game invitation from %0?"),
+    MAKE_STRING(HOME_MENU_FRIENDS_REJECT_GAME_INVITE_MSG,
+                "Reject game invitation from %0?"),
+    MAKE_STRING(HOME_MENU_FRIENDS_REJECT_GAME_INVITE, "Reject Invitation"),
     MAKE_STRING(HOME_MENU_FRIENDS_NEXT_LIST, "Next list"),
-    MAKE_STRING(HOME_MENU_RESTART, "Restart Game"),
     MAKE_STRING(HOME_MENU_SETTINGS, "Settings"),
     MAKE_STRING(HOME_MENU_SETTINGS_SAVE, "Save custom configuration?"),
     MAKE_STRING(HOME_MENU_SETTINGS_SAVE_BUTTON, "Save"),
     MAKE_STRING(HOME_MENU_SETTINGS_DISCARD,
                 "Discard the current settings' changes?"),
     MAKE_STRING(HOME_MENU_SETTINGS_DISCARD_BUTTON, "Discard"),
+    MAKE_STRING(HOME_MENU_SETTINGS_RESET_BUTTON, "To default"),
     MAKE_STRING(HOME_MENU_SETTINGS_AUDIO, "Audio"),
     MAKE_STRING(HOME_MENU_SETTINGS_AUDIO_MASTER_VOLUME, "Master Volume"),
     MAKE_STRING(HOME_MENU_SETTINGS_AUDIO_BACKEND, "Audio Backend"),
@@ -681,14 +958,20 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(HOME_MENU_SETTINGS_AUDIO_TIME_STRETCHING_THRESHOLD,
                 "Time Stretching Threshold"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO, "Video"),
+    MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_VSYNC, "VSync"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_FRAME_LIMIT, "Frame Limit"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_ANISOTROPIC_OVERRIDE,
                 "Anisotropic Filter Override"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_OUTPUT_SCALING, "Output Scaling"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_RCAS_SHARPENING,
                 "FidelityFX CAS Sharpening Intensity"),
+    MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT,
+                "Resolution Scale"),
+    MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_THRESHOLD,
+                "Resolution Scale Threshold"),
     MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_STRETCH_TO_DISPLAY,
                 "Stretch To Display Area"),
+    MAKE_STRING(HOME_MENU_SETTINGS_VIDEO_STEREO_MODE, "Stereo Mode"),
     MAKE_STRING(HOME_MENU_SETTINGS_INPUT, "Input"),
     MAKE_STRING(HOME_MENU_SETTINGS_INPUT_BACKGROUND_INPUT,
                 "Background Input Enabled"),
@@ -712,6 +995,8 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "Accurate RSX reservation access"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_SLEEP_TIMERS_ACCURACY,
                 "Sleep Timers Accuracy"),
+    MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_RSX_MEMORY_TILING,
+                "Handle RSX Memory Tiling"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_MAX_SPURS_THREADS,
                 "Max SPURS Threads"),
     MAKE_STRING(HOME_MENU_SETTINGS_ADVANCED_DRIVER_WAKE_UP_DELAY,
@@ -736,6 +1021,12 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "Show Analog Limiter Toggle Hint"),
     MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_MOUSE_AND_KB_TOGGLE_HINT,
                 "Show Mouse And Keyboard Toggle Hint"),
+    MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_SHOW_FATAL_ERROR_HINTS,
+                "Show Fatal Error Hints"),
+    MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_RECORD_WITH_OVERLAYS,
+                "Record With Overlays"),
+    MAKE_STRING(HOME_MENU_SETTINGS_OVERLAYS_PLAY_MUSIC_DURING_BOOT,
+                "Play music during boot sequence."),
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY, "Performance Overlay"),
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_ENABLE,
                 "Enable Performance Overlay"),
@@ -768,9 +1059,13 @@ static std::pair<std::string, std::u32string> g_strings[] = {
                 "Vertical Margin"),
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FONT_SIZE, "Font Size"),
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_OPACITY, "Opacity"),
+    MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_USE_WINDOW_SPACE,
+                "Use Window Space"),
     MAKE_STRING(HOME_MENU_SETTINGS_DEBUG, "Debug"),
     MAKE_STRING(HOME_MENU_SETTINGS_DEBUG_OVERLAY, "Debug Overlay"),
     MAKE_STRING(HOME_MENU_SETTINGS_DEBUG_INPUT_OVERLAY, "Input Debug Overlay"),
+    MAKE_STRING(HOME_MENU_SETTINGS_MOUSE_DEBUG_INPUT_OVERLAY,
+                "Mouse Debug Overlay"),
     MAKE_STRING(HOME_MENU_SETTINGS_DEBUG_DISABLE_VIDEO_OUTPUT,
                 "Disable Video Output"),
     MAKE_STRING(HOME_MENU_SETTINGS_DEBUG_TEXTURE_LOD_BIAS,
@@ -780,17 +1075,33 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(HOME_MENU_SAVESTATE_SAVE, "Save Emulation State"),
     MAKE_STRING(HOME_MENU_SAVESTATE_AND_EXIT, "Save Emulation State And Exit"),
     MAKE_STRING(HOME_MENU_RELOAD_SAVESTATE, "Reload Last Emulation State"),
+    MAKE_STRING(HOME_MENU_RELOAD_SECOND_SAVESTATE,
+                "Reload Second-To-Last Emulation State"),
+    MAKE_STRING(HOME_MENU_RELOAD_THIRD_SAVESTATE,
+                "Reload Third-To-Last Emulation State"),
+    MAKE_STRING(HOME_MENU_RELOAD_FOURTH_SAVESTATE,
+                "Reload Fourth-To-Last Emulation State"),
+    MAKE_STRING(HOME_MENU_TOGGLE_FULLSCREEN, "Toggle Fullscreen"),
     MAKE_STRING(HOME_MENU_RECORDING, "Start/Stop Recording"),
     MAKE_STRING(HOME_MENU_TROPHIES, "Trophies"),
+    MAKE_STRING(HOME_MENU_TROPHY_LIST_TITLE, "Trophy Progress: %0"),
+    MAKE_STRING(HOME_MENU_TROPHY_LOCKED_TITLE, "Locked trophy: %0"),
     MAKE_STRING(HOME_MENU_TROPHY_HIDDEN_TITLE, "Hidden trophy"),
     MAKE_STRING(HOME_MENU_TROPHY_HIDDEN_DESCRIPTION, "This trophy is hidden"),
+    MAKE_STRING(HOME_MENU_TROPHY_SHOW_HIDDEN_TROPHIES, "Show hidden trophies"),
+    MAKE_STRING(HOME_MENU_TROPHY_HIDE_HIDDEN_TROPHIES, "Hide hidden trophies"),
     MAKE_STRING(HOME_MENU_TROPHY_PLATINUM_RELEVANT, "Platinum relevant"),
     MAKE_STRING(HOME_MENU_TROPHY_GRADE_BRONZE, "Bronze"),
     MAKE_STRING(HOME_MENU_TROPHY_GRADE_SILVER, "Silver"),
     MAKE_STRING(HOME_MENU_TROPHY_GRADE_GOLD, "Gold"),
     MAKE_STRING(HOME_MENU_TROPHY_GRADE_PLATINUM, "Platinum"),
+    MAKE_STRING(HOME_MENU_TROPHY_SORT_GAME_DEFAULT, "Sort: Game Default"),
+    MAKE_STRING(HOME_MENU_TROPHY_SORT_NOT_EARNED, "Sort: Not Earned"),
+    MAKE_STRING(HOME_MENU_TROPHY_SORT_EARNED_DATE, "Sort: Earned Date"),
+    MAKE_STRING(HOME_MENU_TROPHY_SORT_GRADE, "Sort: Grade"),
     MAKE_STRING(AUDIO_MUTED, "Audio muted"),
     MAKE_STRING(AUDIO_UNMUTED, "Audio unmuted"),
+    MAKE_STRING(AUDIO_CHANGED, "Volume changed to %0"),
     MAKE_STRING(PROGRESS_DIALOG_PROGRESS, "Progress:"),
     MAKE_STRING(PROGRESS_DIALOG_PROGRESS_ANALYZING, "Progress: analyzing..."),
     MAKE_STRING(PROGRESS_DIALOG_REMAINING, "remaining"),
@@ -820,20 +1131,72 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(EMULATION_RESUMING, "Resuming...!"),
     MAKE_STRING(EMULATION_FROZEN,
                 "The PS3 application has likely crashed, you can close it."),
+    MAKE_STRING(SAVESTATE_FAILED_DUE_TO_VDEC,
+                "SaveState failed: VDEC-based video/cutscenes are in order, "
+                "wait for them to end or enable libvdec.sprx."),
     MAKE_STRING(
         SAVESTATE_FAILED_DUE_TO_SAVEDATA,
         "SaveState failed: Game saving is in progress, wait until finished."),
-    MAKE_STRING(SAVESTATE_FAILED_DUE_TO_VDEC,
-                "SaveState failed: VDEC-base video/cutscenes are in order, "
-                "wait for them to end or enable libvdec.sprx."),
-    MAKE_STRING(SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING,
-                "SaveState failed: Failed to lock SPU state, enabling "
-                "SPU-Compatible mode may fix it."),
     MAKE_STRING(SAVESTATE_FAILED_DUE_TO_SPU,
                 "SaveState failed: Failed to lock SPU state, using SPU ASMJIT "
                 "will fix it."),
-    MAKE_STRING(INVALID, "Invalid"),
+    MAKE_STRING(SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING,
+                "SaveState failed: Failed to lock SPU state, enabling "
+                "SPU-Compatible mode may fix it."),
 };
+
+#undef MAKE_STRING
+
+// One index per enum entry, so an id upstream adds is a hole in the middle of
+// the table rather than a shift, and both show up here instead of in a blank
+// dialog on a phone.
+static_assert(
+    std::size(g_strings) ==
+        std::size_t(
+            localized_string_id::SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING) +
+            1,
+    "localized_string_id grew: add the new string(s) to g_strings and move "
+    "this to the new last id");
+
+// The desktop frontend hands the string to QString::arg(), which replaces the
+// lowest numbered "%N" place marker wherever it appears. Every string the core
+// passes an argument to uses %0 and passes exactly one, so that reduces to
+// this. Dropping the argument is why the save-data prompt showed no entry
+// title, date or size, and why every cellMsgDialog error arrived without its
+// error code.
+template <typename T>
+static std::basic_string<T> substitute_arg(std::basic_string<T> text,
+                                           std::basic_string_view<T> arg) {
+  const T marker[] = {T('%'), T('0'), T(0)};
+
+  for (std::size_t pos = text.find(marker); pos != text.npos;
+       pos = text.find(marker, pos + arg.size())) {
+    text.replace(pos, 2, arg);
+  }
+
+  return text;
+}
+
+static const std::pair<std::string, std::u32string> *
+find_localized_string(localized_string_id id) {
+  const std::size_t index = std::size_t(id);
+
+  if (index >= std::size(g_strings)) {
+    rpcsx_android.error("No localized string for id %d", int(id));
+    return nullptr;
+  }
+
+  // RSX_OVERLAYS_SPINNER_NO_TEXT is deliberately empty; anything else empty is
+  // a hole.
+  if (g_strings[index].first.empty() &&
+      id != localized_string_id::RSX_OVERLAYS_SPINNER_NO_TEXT) {
+    rpcsx_android.error("Localized string %d is missing from g_strings",
+                        int(id));
+    return nullptr;
+  }
+
+  return &g_strings[index];
+}
 
 enum GameFlags {
   kGameFlagLocked = 1 << 0,
@@ -1997,6 +2360,10 @@ static void setupCallbacks() {
               result = std::make_shared<NullAudioBackend>();
               break;
 
+            case audio_renderer::oboe:
+              result = std::make_shared<OboeBackend>();
+              break;
+
             case audio_renderer::cubeb:
             default:
               result = std::make_shared<CubebBackend>();
@@ -2023,18 +2390,23 @@ static void setupCallbacks() {
       .get_trophy_notification_dialog =
           [](auto...) { return std::make_unique<OverlayTrophyNotification>(); },
       .get_localized_string = [](localized_string_id id,
-                                 const char *) -> std::string {
-        if (std::size_t(id) < std::size(g_strings)) {
-          return g_strings[int(id)].first;
+                                 const char *args) -> std::string {
+        const auto *entry = find_localized_string(id);
+        if (!entry) {
+          return "";
         }
-        return "";
+        return substitute_arg<char>(entry->first, args ? args : "");
       },
       .get_localized_u32string = [](localized_string_id id,
-                                    const char *) -> std::u32string {
-        if (std::size_t(id) < std::size(g_strings)) {
-          return g_strings[int(id)].second;
+                                    const char *args) -> std::u32string {
+        const auto *entry = find_localized_string(id);
+        if (!entry) {
+          return U"";
         }
-        return U"";
+        // Trophy names reach this one, so the argument has to be decoded rather
+        // than widened byte by byte.
+        const std::u32string arg = utf8_to_u32string(args ? args : "");
+        return substitute_arg<char32_t>(entry->second, arg);
       },
       .get_localized_setting = [](auto...) { return ""; },
       .play_sound = [](auto...) {},
@@ -2157,6 +2529,8 @@ extern "C" bool _rpcsx_overlayPadData(int port, int digital1, int digital2,
     return false;
   }
 
+  const auto &pressure = g_virtual_pad_pressure[port];
+
   for (auto &btn : pad->m_buttons) {
     if (btn.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL1) {
       btn.m_pressed = (digital1 & btn.m_outKeyCode) != 0;
@@ -2171,13 +2545,50 @@ extern "C" bool _rpcsx_overlayPadData(int port, int digital1, int digital2,
       btn.m_pressed = (digital2 & btn.m_outKeyCode) != 0;
     }
 
-    btn.m_value = btn.m_pressed ? 255 : 0;
+    // A pressed button was worth exactly 255, which is what cellPad copies into
+    // the press byte a game reads for analog buttons -- so every pressure-capable
+    // button on this port was fully digital no matter what the hardware sent. A
+    // physical L2/R2 went 0 to 100 with no half-press (reported on Iron Man's
+    // hover tutorial, which cannot be passed without one), and the touch overlay's
+    // pressure modifier set a value that was discarded here.
+    const int idx = pressure_index_for(btn.m_offset, btn.m_outKeyCode);
+    const int analog = idx < 0 ? 0 : pressure[idx].load(std::memory_order_relaxed);
+
+    // 0 means no analog source is driving this button -- every button on a pad
+    // without analog buttons -- so the digital answer stays the default.
+    btn.m_value = !btn.m_pressed ? 0 : (analog <= 0 ? 255 : analog);
   }
 
   pad->m_sticks[0].m_value = leftStickX;
   pad->m_sticks[1].m_value = leftStickY;
   pad->m_sticks[2].m_value = rightStickX;
   pad->m_sticks[3].m_value = rightStickY;
+  return true;
+}
+
+// Analog pressure for this port's pressure-capable buttons. `values` is in press
+// offset order (CELL_PAD_BTN_OFFSET_PRESS_RIGHT..PRESS_R2), each 1..255, or 0 to
+// leave that button digital.
+//
+// Separate from _rpcsx_overlayPadData so the pressure survives a snapshot push
+// that does not carry it: the caller sets pressure when a trigger moves and pushes
+// the whole pad on every input event, and the two orders must both work.
+extern "C" bool _rpcsx_overlayPadPressure(int port, const int *values,
+                                          int count) {
+  if (port < 0 || static_cast<usz>(port) >= g_virtual_pad_pressure.size() ||
+      values == nullptr) {
+    return false;
+  }
+
+  // Tolerate a shorter or longer array than this core knows about, so glue and
+  // core can be updated independently without one truncating the other's pad.
+  const int n = std::min(count, PRESSURE_COUNT);
+
+  for (int i = 0; i < n; i++) {
+    g_virtual_pad_pressure[port][i].store(std::clamp(values[i], 0, 255),
+                                          std::memory_order_relaxed);
+  }
+
   return true;
 }
 
@@ -2555,6 +2966,13 @@ extern "C" void _rpcsx_kill() {
 }
 extern "C" void _rpcsx_resume() { Emu.Resume(); }
 
+// The counterpart to _rpcsx_resume, which had none. Rpcs3Bridge.pause() set a bool and returned,
+// on the belief that "RPCS3 has no explicit pause entry point" -- but Emu.Pause() is right here,
+// and _rpcsx_surfaceEvent has always called it on surface loss. That is why BACKGROUNDING the app
+// was the only thing that actually paused, while the in-game pause menu left the emulator running
+// underneath it, and why pause/resume were asymmetric: resume() reached the core, pause() did not.
+extern "C" void _rpcsx_pause() { Emu.Pause(); }
+
 extern "C" void _rpcsx_openHomeMenu() {
   if (auto padThread = pad::get_pad_thread(true)) {
     padThread->open_home_menu();
@@ -2562,6 +2980,35 @@ extern "C" void _rpcsx_openHomeMenu() {
 }
 
 extern "C" std::string _rpcsx_getTitleId() { return Emu.GetTitleID(); }
+
+// ADPF: what the last frame actually cost, and which OS thread presents it. The app feeds
+// these to PerformanceHintManager. Zero means 'not measured yet' -- the caller must skip.
+extern "C" u64 _rpcsx_getFramePeriodNs() { return rpcs3::utils::get_frame_period_ns(); }
+extern "C" u64 _rpcsx_getFrameWorkNs() { return rpcs3::utils::get_frame_work_ns(); }
+extern "C" s32 _rpcsx_getRsxThreadTid() { return rpcs3::utils::get_rsx_thread_tid(); }
+
+// The RUNNING game's trophy set, e.g. "NPWR05636_00" -- or "" when no game is
+// running, or the game has not created a trophy context yet (many only do so once
+// you reach a menu), or it has no trophies at all.
+//
+// This is the SAME value RPCS3's own home menu reads to decide whether to offer its
+// Trophies item and which set to hand the overlay
+// (overlay_home_menu_main_menu.cpp); sceNpTrophyCreateContext writes it. The
+// frontend needs it because trophy folders under dev_hdd0/home/<user>/trophy are
+// named by NPWR comm id, NOT by title id, and there is no general way to derive one
+// from the other on disk: a disc game's TROPDIR lives inside the ISO, so a
+// title-id -> NPWR mapping only exists for installed titles.
+extern "C" std::string _rpcsx_getCurrentTrophyName() {
+  // try_get, not get: get<> CONSTRUCTS the object when it is absent, which would
+  // both allocate outside emulation and hand back an empty name that looks the same
+  // as "no trophies". try_get returns null until the fixed-object is initialised.
+  if (auto *current = g_fxo->try_get<current_trophy_name>()) {
+    std::lock_guard lock(current->mtx);
+    return current->name;
+  }
+
+  return {};
+}
 
 // ---------------------------------------------------------------------------
 // Save states
@@ -2840,6 +3287,19 @@ static std::string json_quote(std::string_view v) {
   return out + "\"";
 }
 
+/**
+ * The patch schema version this core can parse.
+ *
+ * rpcs3.net serves a different schema per version and patch_engine::load
+ * rejects a file whose Version header does not match, so the app has to ask
+ * for the version built into the core rather than name one itself. It had 1.2
+ * hardcoded in the download URL, which is right until upstream bumps the
+ * constant and every download starts failing to parse.
+ */
+extern "C" std::string _rpcsx_patchEngineVersion() {
+  return patch_engine_version;
+}
+
 extern "C" int _rpcsx_patchesImport(std::string_view content) {
   patch_engine::patch_map patches;
   std::stringstream log;
@@ -2969,6 +3429,27 @@ extern "C" std::string _rpcsx_probeDiscInfo(std::string_view isoPath,
     return "{}";
   }
 
+  // g_fxo has to be set up before anything mounts, and being STOPPED is exactly when it is not.
+  //
+  // vfs::mount() lazily constructs vfs_manager through manual_typemap::init<T>(), and init<T>()
+  // writes `*m_order++ = data`. clear() frees those arrays and sets m_order/m_info to nullptr, and
+  // g_fxo is cleared when a game stops -- so a scan that probes an ISO after any game has run this
+  // session wrote through a null pointer. RPCS3's signal handler caught it and turned it into a
+  // fatal exit: reported as "I scanned the library and the app crashed", and it is why the same
+  // scan is harmless on a fresh launch and lethal after playing something.
+  //
+  // The Emu.IsStopped() check above cannot catch this, because stopped IS the cleared state. The
+  // predicate that matters is is_init(), which is m_info != nullptr.
+  //
+  // Set up and hand it back exactly as found: reset() allocates the bookkeeping without
+  // constructing anything, the mount then constructs vfs_manager on demand, and clear() destroys
+  // it and frees the arrays again. Safe under g_emu_lifecycle_mutex, which no boot can cross.
+  const bool fxo_needs_setup = !g_fxo->is_init();
+
+  if (fxo_needs_setup) {
+    g_fxo->reset();
+  }
+
   // unload_iso() on every exit: leaving the device mounted would shadow the
   // next boot's disc with whichever image was scanned last.
   try {
@@ -2980,6 +3461,11 @@ extern "C" std::string _rpcsx_probeDiscInfo(std::string_view isoPath,
   }
 
   unload_iso();
+
+  if (fxo_needs_setup) {
+    g_fxo->clear();
+  }
+
   return result;
 }
 
@@ -2996,17 +3482,24 @@ extern "C" std::string _rpcsx_patchesList(std::string_view serial) {
 
   for (const auto &[hash, container] : db) {
     for (const auto &[description, info] : container.patch_info_map) {
-      // A patch lists the titles it applies to; keep only ones naming this
-      // serial, or the "all games" wildcard RPCS3 uses.
-      // titles maps GAME TITLE -> serial -> app_version. "all" is RPCS3's
-      // wildcard serial, used by patches that are not tied to one release.
+      // A patch lists the titles it applies to; a per-game list keeps only the
+      // ones naming this serial.
+      //
+      // Deliberately NOT patch_key::all here. Wildcard patches are keyed by SPU
+      // or PPU hash and leave the serial as "All" because the hash is the
+      // filter, so they belong to no particular game: the database has 17 of
+      // them and listing them under every game buries each game's own handful,
+      // while toggling one from a game's list writes the shared "All" entry and
+      // changes every other game too. Desktop RPCS3 shows them once, under
+      // their own "All titles" node (patch_manager_dialog.cpp), and the global
+      // list below (empty serial) is this app's equivalent.
       bool applies = serial.empty();
       std::string app_version = "all";
       std::string game_title;
 
       for (const auto &[title, serials] : info.titles) {
         for (const auto &[ser, versions] : serials) {
-          const bool hit = (!serial.empty() && ser == serial) || ser == "all";
+          const bool hit = !serial.empty() && ser == serial;
           if (hit || serial.empty()) {
             if (game_title.empty()) game_title = title;
           }
@@ -3020,14 +3513,25 @@ extern "C" std::string _rpcsx_patchesList(std::string_view serial) {
 
       if (!applies) continue;
 
+      // Enabled state has to be read for THIS serial only. patchSetEnabled
+      // writes per serial, so a patch switched on from another game's list has
+      // an enabled entry under that game's serial and none under this one --
+      // counting any enabled entry reported it as on for every game the patch
+      // covers, and the row then showed a toggle the game was not getting.
+      // A wildcard entry still counts: a patch listed here for its own serial
+      // can also carry an "All" entry, and an enabled one of those does reach
+      // this game even though wildcard-only patches are not listed above.
       bool is_on = false;
       if (auto it = enabled.find(hash); it != enabled.end()) {
         if (auto p = it->second.patch_info_map.find(description);
             p != it->second.patch_info_map.end()) {
           for (const auto &[title, serials] : p->second.titles)
-            for (const auto &[ser, versions] : serials)
+            for (const auto &[ser, versions] : serials) {
+              if (!serial.empty() && ser != serial && ser != patch_key::all)
+                continue;
               for (const auto &[ver, values] : versions)
                 if (values.enabled) is_on = true;
+            }
         }
       }
 
@@ -3081,10 +3585,13 @@ extern "C" bool _rpcsx_patchSetEnabled(std::string_view hash,
   auto &info = entry.patch_info_map[std::string(description)];
   info = p->second;
 
+  // patch_key::all is spelled "All"; the lowercase literal this used to compare
+  // against never matched, so a wildcard patch toggled from a game's own list
+  // wrote nothing and the switch did nothing.
   for (auto &[title, serials] : info.titles)
     for (auto &[ser, versions] : serials)
       for (auto &[ver, values] : versions)
-        if (ser == serial || serial.empty() || ser == "all")
+        if (ser == serial || serial.empty() || ser == patch_key::all)
           values.enabled = enabled;
 
   patch_engine::save_config(config);
@@ -3134,15 +3641,31 @@ extern "C" bool _rpcsx_surfaceEvent(JNIEnv *env, jobject surface, jint event) {
     //
     // _rpcsx_openHomeMenu already uses the relaxed form; this call site was
     // missed.
-    if (auto padThread = pad::get_pad_thread(true)) {
-      padThread->open_home_menu();
-    }
+    // surfaceDestroyed runs on the Android UI thread, and both open_home_menu() and
+    // Emu.Pause() can block for many seconds during a first-boot bulk PPU precompile (the
+    // guest main thread is parked waiting on modules). That froze the UI into an ANR and a
+    // force-close whenever someone backgrounded a still-compiling first boot. The native
+    // window is already released above -- the only thing the SurfaceHolder contract
+    // actually requires -- so hand the rest to a detached worker and return now.
+    // Ported from ouroboros420/rpcsx (31d1425bc).
+    std::thread([] {
+      if (auto padThread = pad::get_pad_thread(true)) {
+        padThread->open_home_menu();
+      }
 
-    // Remember whether this pause is ours. The app pauses for its own reasons too (the
-    // in-game overlay), and resuming on the next surface would then undo a pause the user
-    // asked for, behind an overlay still showing the game as paused.
-    g_paused_by_surface_loss = !Emu.IsPaused();
-    Emu.Pause();
+      // Only pause if the surface is still gone. A quick destroy->recreate (a rotation, a
+      // transient focus loss) fires the gained event and resumes; that resume has to win
+      // the race against this deferred pause, not lose to it.
+      if (g_native_window.load() != nullptr) {
+        return;
+      }
+
+      // Remember whether this pause is ours. The app pauses for its own reasons too (the
+      // in-game overlay), and resuming on the next surface would then undo a pause the user
+      // asked for, behind an overlay still showing the game as paused.
+      g_paused_by_surface_loss = !Emu.IsPaused();
+      Emu.Pause();
+    }).detach();
 
 #ifdef ARMSX3_PGO_GENERATE
     // Backgrounding is the reliable flush point; see pgo_flush.
@@ -4245,6 +4768,15 @@ extern "C" std::string _rpcsx_getVersion() {
 //
 // Returns the PREVIOUS handle so the caller can dlclose it. Passing nullptr
 // reverts to the system driver.
+// Lets the UI glue put a driver problem where bug reports will carry it.
+//
+// The glue can only reach logcat, which nobody attaches to an issue, and the reason a
+// custom driver was refused is exactly what a report needs. Routed through the emulator
+// log channel so it lands in RPCSX.log beside the driver identity it explains.
+extern "C" void _rpcsx_reportDriverProblem(std::string message) {
+  rpcsx_android.error("%s", message);
+}
+
 extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
   void *previous = vk::android::set_driver_handle(driverHandle);
 

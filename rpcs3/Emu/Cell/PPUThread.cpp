@@ -171,7 +171,7 @@ bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_b
 extern void ppu_initialize();
 extern void ppu_finalize(const ppu_module<lv2_obj>& info, bool force_mem_release = false);
 extern bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only = false, u64 file_size = 0);
-static void ppu_initialize2(class jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name);
+static bool ppu_initialize2(class jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name);
 extern bool ppu_load_exec(const ppu_exec_object&, bool virtual_load, const std::string&, utils::serial* = nullptr);
 extern std::pair<shared_ptr<lv2_overlay>, CellError> ppu_load_overlay(const ppu_exec_object&, bool virtual_load, const std::string& path, s64 file_offset, utils::serial* = nullptr);
 extern void ppu_unload_prx(const lv2_prx&);
@@ -5339,6 +5339,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				accurate_nj_mode,
 				contains_symbol_resolver,
 				daz_and_ftz,
+				arm64_codegen_v2,
 
 				__bitset_enum_max
 			};
@@ -5348,6 +5349,18 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			settings += ppu_settings::_reserved_for_backwards_compatibility;
 #if !defined(_WIN32) && !defined(__APPLE__)
 			settings += ppu_settings::platform_bit;
+#endif
+#if defined(ARCH_ARM64)
+			// Cache identity for ARM64 PPU codegen. The cache key is otherwise only the
+			// executable's SHA-1 plus these settings, with nothing naming the build, so a codegen
+			// change silently reuses objects compiled by the previous version. That is not
+			// hypothetical: the FCTIW/FCTID saturation fix appeared to do nothing because the game
+			// reloaded its old objects and never recompiled.
+			//
+			// Add a new value (arm64_codegen_v3, ...) and set that instead whenever ARM64 PPU
+			// codegen changes. Never re-toggle an old one -- that would collide with hashes already
+			// on disk from an earlier build.
+			settings += ppu_settings::arm64_codegen_v2;
 #endif
 			if (g_cfg.core.use_accurate_dfma)
 				settings += ppu_settings::accurate_dfma;
@@ -5503,6 +5516,8 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 					ppu_log.warning("LLVM: Compiling module %s%s", cache_path, obj_name);
 
+					bool compiled_this_module = false;
+
 					{
 #ifdef __ANDROID__
 						// Compile alone while memory is short. Checked per module rather
@@ -5561,10 +5576,20 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 						// Use another JIT instance
 						jit_compiler jit2({}, g_cfg.core.llvm_cpu.to_string(), 0x1);
-						ppu_initialize2(jit2, part, cache_path, obj_name);
+						compiled_this_module = ppu_initialize2(jit2, part, cache_path, obj_name);
 					}
 
-					ppu_log.success("LLVM: Compiled module %s", obj_name);
+					if (compiled_this_module)
+					{
+						ppu_log.success("LLVM: Compiled module %s", obj_name);
+					}
+					else
+					{
+						// Not fatal on purpose. The loop increment below still runs, so this module
+						// is accounted for in the progress total and the boot completes; its
+						// functions simply have no compiled code and fall back to the interpreter.
+						ppu_log.error("LLVM: Module %s did not compile; its functions will be interpreted", obj_name);
+					}
 				}
 
 				core_lock.unlock();
@@ -5636,7 +5661,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		jit_mod.symbol_resolvers.resize(jits.size());
 	}
 
-	bool failed_to_load = false;
+	usz failed_module_count = 0;
 	{
 		if (!is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
 		{
@@ -5664,21 +5689,29 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				break;
 			}
 
-			if (!failed_to_load && !jits[mod_index / c_moudles_per_jit]->add(cache_path + obj_name))
+			// One module failing no longer abandons the rest.
+			//
+			// This flag used to be sticky and also gated the add() above, so the FIRST object that
+			// would not load stopped every later module from even being attempted. With the
+			// compile side now surviving a module LLVM cannot codegen, that turned one bad module
+			// into a nearly-uncompiled game: Saint Seiya's failure sits at index 6 of 134, so 128
+			// modules were skipped and the title ran slower with the recompiler than with the
+			// interpreter (6fps vs 23fps reported on issue #25) -- the per-function fallback costs
+			// more than interpreting outright.
+			//
+			// Skipping only the module that failed is safe for the same reason excluded_funcs is:
+			// a guest function with no compiled code keeps its dispatcher entry and is interpreted.
+			// So the cost of a bad module is its own functions, not the whole executable.
+			if (!jits[mod_index / c_moudles_per_jit]->add(cache_path + obj_name))
 			{
-				ppu_log.error("LLVM: Failed to load module %s", obj_name);
-				failed_to_load = true;
+				ppu_log.error("LLVM: Failed to load module %s; its functions will be interpreted", obj_name);
+				failed_module_count++;
 			}
 
 			if (mod_index % increment_link_count_at == (link_workload.size() - 1) % increment_link_count_at)
 			{
 				// Incremenet 'pdone' Nth times where N is link workload size ceil-divided by increment_link_count_at
 				g_progr_pdone++;
-			}
-
-			if (failed_to_load)
-			{
-				continue;
 			}
 
 			if (!is_compiled)
@@ -5688,7 +5721,23 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		}
 	}
 
-	if (failed_to_load || !is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
+	// Deliberately NOT bailing on a load failure any more.
+	//
+	// Everything below is what makes the modules that DID load usable: jit->fin() finalises them
+	// and the symbol resolvers are what wire the guest function table to the compiled code.
+	// Returning here left all of them loaded but unfinalised, so ONE module that could not be read
+	// cost the entire executable its recompiled code, not just its own functions. That is why
+	// Saint Seiya measured slower on the recompiler than on the interpreter.
+	//
+	// A module that failed is already absent from its jit, and its functions keep the dispatcher
+	// entry that interprets them, so finalising the rest is both correct and the whole point.
+	if (failed_module_count)
+	{
+		ppu_log.error("LLVM: %u of %u modules could not be loaded; those functions will be "
+			"interpreted, the rest are compiled as usual", failed_module_count, link_workload.size());
+	}
+
+	if (!is_being_used_in_emulation || (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped()))
 	{
 		return compiled_new;
 	}
@@ -5815,7 +5864,10 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 #endif
 }
 
-static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name)
+// Returns false when this module produced no object file, for any reason. The caller must not
+// report it as compiled: the whole point is that a module can now fail without taking the
+// worker, and therefore the boot, with it.
+static bool ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name)
 {
 #ifdef LLVM_AVAILABLE
 	using namespace llvm;
@@ -5904,7 +5956,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			if (Emu.IsStopped())
 			{
 				ppu_log.success("LLVM: Translation cancelled");
-				return;
+				return false;
 			}
 
 			if (mod_func.size)
@@ -5930,7 +5982,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 				else
 				{
 					Emu.Pause();
-					return;
+					return false;
 				}
 			}
 		}
@@ -5948,7 +6000,7 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			else
 			{
 				Emu.Pause();
-				return;
+				return false;
 			}
 		}
 
@@ -5975,13 +6027,41 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 			out.flush();
 			ppu_log.error("LLVM: Verification failed for %s:\n%s", obj_name, result);
 			Emu.CallFromMainThread([]{ Emu.GracefulShutdown(false, true); });
-			return;
+			return false;
 		}
 
 		ppu_log.notice("LLVM: %zu functions generated (code_size=0x%x, num_func=%d, max_addr(-)min_addr=0x%x)", _module->getFunctionList().size(), guest_code_size, num_func, max_addr - min_addr);
 	}
 
 	// Load or compile module
+#ifdef ARCH_ARM64
+	// The recoverable variant, for the same reason the SPU recompiler uses it (see
+	// SPULLVMRecompiler.cpp, the ARCH_ARM64 branch): LLVM's AArch64 register allocator can fail
+	// outright on a module, and plain add() routes that through LLVM's fatal handler, which for a
+	// thread with no recovery context throws and kills the thread.
+	//
+	// Killing THIS thread is not a lost module, it is a lost boot. The compile loop increments
+	// g_progr_pdone in its loop INCREMENT, so a worker that dies mid-body never accounts for the
+	// module it was holding; g_progr_ptotal can then never reach zero and ppu_initialize's caller
+	// waits on it forever. Reported against Saint Seiya: The Sanctuary (BLES01421, issue #25) as
+	// "the PPU cache never finishes, it gets stuck at the end" -- it reached 133 of 134 and stopped,
+	// on 'Error while trying to spill X8 from class GPR64: Cannot scavenge register without an
+	// emergency spill slot!'. Interpreter worked because it never enters this path at all. The
+	// death also halved the remaining throughput, one worker of two being gone.
+	//
+	// jit2 is constructed per module at the call site, so a poisoned engine dies with it and cannot
+	// contaminate the next module.
+	std::string llvm_error;
+
+	if (!jit.try_add(std::move(_module), cache_path, llvm_error))
+	{
+		ppu_log.error("LLVM: Failed to compile module %s: %s", obj_name, llvm_error);
+		return false;
+	}
+#else
 	jit.add(std::move(_module), cache_path);
+#endif
 #endif // LLVM_AVAILABLE
+
+	return true;
 }

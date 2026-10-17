@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "RSXThread.h"
+#include "Emu/android_app_state.h"
 
 #include "Capture/rsx_capture.h"
 #include "Common/surface_store.h"
@@ -140,7 +141,8 @@ namespace rsx
 	constexpr u32 fs_export_config_mask =
 		RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE |
 		RSX_SHADER_CONTROL_ROP_MULTISAMPLED |
-		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING;
+		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING |
+		RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE;
 
 	rsx_iomap_table::rsx_iomap_table() noexcept
 		: ea(fill_array(-1))
@@ -1054,6 +1056,22 @@ namespace rsx
 		while (method_registers.current_draw_clause.next());
 	}
 
+	bool thread::should_skip_draw() const
+	{
+		if (skip_current_frame || !m_graphics_state.test(rsx::rtt_config_valid) || cond_render_ctrl.disable_rendering())
+		{
+			return true;
+		}
+
+		if (m_graphics_state.test(rsx::rtt_config_no_attachments) &&
+			(g_cfg.video.disable_zcull_queries || !zcull_ctrl->has_active_queries()))
+		{
+			return true;
+		}
+
+		return false;
+	}
+
 	void thread::cpu_task()
 	{
 		while (Emu.IsReady())
@@ -1318,7 +1336,8 @@ namespace rsx
 
 					while (Emu.IsPaused() && !is_stopped())
 					{
-						thread_ctrl::wait_for(5'000);
+						// ARMSX3: 4 checks a second instead of 200 while the app is out of sight (#196)
+						thread_ctrl::wait_for(g_android_app_backgrounded ? 250'000 : 5'000);
 					}
 
 					// Restore difference
@@ -1631,6 +1650,7 @@ namespace rsx
 		layout.width = rsx::method_registers.surface_clip_width();
 		layout.height = rsx::method_registers.surface_clip_height();
 
+		// NOTE: rtt_config_no_attachments is intentionally not reset.
 		m_graphics_state.clear(rsx::rtt_config_contested | rsx::rtt_config_valid);
 		m_current_framebuffer_context = context;
 
@@ -1943,10 +1963,34 @@ namespace rsx
 			m_graphics_state.set(rsx::rtt_config_valid);
 		}
 
-		if (!m_graphics_state.test(rsx::rtt_config_valid) && !layout.zeta_address)
+		const bool framebufferless = !m_graphics_state.test(rsx::rtt_config_valid) && !layout.zeta_address;
+		if (framebufferless)
 		{
-			rsx_log.warning("Framebuffer setup failed. Draw calls may have been lost");
-			return;
+			// No attachments. The hardware still rasterizes in this case and side effects such as ZPASS counters are still updated.
+			if (context != rsx::framebuffer_creation_context::context_draw ||
+				!backend_config.supports_framebufferless_rendering)
+			{
+				rsx_log.warning("Framebuffer setup failed. Draw calls may have been lost");
+				return;
+			}
+
+			// Context must be draw now...
+		}
+
+		if (framebufferless != m_graphics_state.test(rsx::rtt_config_no_attachments))
+		{
+			// Programmable blending reads back from the color attachments and is disabled when there are none.
+			// Force the blend configuration to be re-evaluated when moving in or out of this state.
+			if (framebufferless)
+			{
+				m_graphics_state.set(rsx::rtt_config_no_attachments);
+			}
+			else
+			{
+				m_graphics_state.clear(rsx::rtt_config_no_attachments);
+			}
+
+			m_graphics_state.set(rsx::pipeline_config_dirty);
 		}
 
 		// At least one attachment exists
@@ -2022,7 +2066,8 @@ namespace rsx
 			}
 		}
 
-		if (!really_changed)
+		// Framebufferless setups have no surface info to compare against. Always rebuild.
+		if (!really_changed && !framebufferless)
 		{
 			if (layout.zeta_address == m_depth_surface_info.address &&
 				layout.depth_format == m_depth_surface_info.depth_format &&
@@ -2288,8 +2333,9 @@ namespace rsx
 	{
 		u32 expected_ctrl = 0;
 
-		// Programmable blending
-		if (backend_config.supports_programmable_blending)
+		// Programmable blending. Requires color attachments to read from.
+		if (backend_config.supports_programmable_blending &&
+			!m_graphics_state.test(rsx::rtt_config_no_attachments))
 		{
 			expected_ctrl = current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING;
 
@@ -2305,6 +2351,11 @@ namespace rsx
 			backend_config.supports_hw_msaa)
 		{
 			expected_ctrl |= RSX_SHADER_CONTROL_ROP_MULTISAMPLED;
+		}
+
+		if (requires_depth_range_emulation()) [[ unlikely ]]
+		{
+			expected_ctrl |= RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE;
 		}
 
 		// Depth compare
@@ -2334,6 +2385,16 @@ namespace rsx
 		}
 
 		return expected_ctrl;
+	}
+
+	bool thread::requires_depth_range_emulation() const
+	{
+		if (backend_config.supports_extended_depth_range || !g_cfg.video.emulate_extended_depth_range) [[ likely ]]
+		{
+			return false;
+		}
+
+		return m_framebuffer_layout.zeta_address && rsx::is_float_depth_format(REGS(m_ctx)->surface_depth_fmt());
 	}
 
 	void thread::prefetch_fragment_program()
@@ -2463,6 +2524,13 @@ namespace rsx
 			m_graphics_state.clear(rsx::pipeline_state::xform_instancing_state_dirty);
 
 			// Emit invalidate here in case ucode is actually clean
+			m_program_cache_hint.invalidate_vertex_program(current_vertex_program);
+		}
+
+		if (const bool emulate_depth_range = requires_depth_range_emulation();
+			emulate_depth_range != !!(current_vertex_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE))
+		{
+			current_vertex_program.ctrl ^= RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE;
 			m_program_cache_hint.invalidate_vertex_program(current_vertex_program);
 		}
 
@@ -3659,11 +3727,21 @@ namespace rsx
 				{
 					rsx_log.success("Capture successful: %s", file_path);
 					frame_capture.reset();
+#ifdef __ANDROID__
+					// Keep playing, and say where it went. Upstream pauses so the frame can be looked at
+					// from the desktop UI; on Android nothing said the game had been paused or offered
+					// a way back, so a capture looked like the game had frozen.
+					rsx::overlays::queue_message(fmt::format("RSX capture saved: config/%s", file_path.substr(fs::get_config_dir().size())), 6'000'000);
+#else
 					pause_emulator = true;
+#endif
 				}
 				else
 				{
 					rsx_log.error("Capture failed: %s (%s)", file_path, fs::g_tls_error);
+#ifdef __ANDROID__
+					rsx::overlays::queue_message(fmt::format("RSX capture failed: %s", fs::g_tls_error), 6'000'000);
+#endif
 				}
 			}
 			else

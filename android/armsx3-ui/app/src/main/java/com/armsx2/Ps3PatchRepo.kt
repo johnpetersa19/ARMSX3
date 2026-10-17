@@ -323,6 +323,12 @@ object Ps3PatchRepo {
      * keeps a bump from touching the patches that were already here: an install whose
      * stored revision is at or above it has been offered this patch once already, and
      * whatever the user did with the toggle afterwards is their answer.
+     *
+     * The exception is 14. Until then patchSetEnabled kept only the LAST serial of a patch
+     * enabled for several serials in a row (rpcsx-android.cpp explains why), so every
+     * earlier serial of such a group was never actually turned on, whatever the stored
+     * revision says. Those entries are offered again at 14; the last of each group keeps
+     * its original revision, since that one did turn on and a user's OFF there is real.
      */
     private data class Bundled(
         val hash: String,
@@ -333,6 +339,60 @@ object Ps3PatchRepo {
     )
 
     private val BUNDLED = listOf(
+        // THE IDOLM@STER 2, NPJB00337 v01.00 -- ours. A scene change frees objects that the draw
+        // thread is still drawing from last frame's list, which holds them without a reference;
+        // the frame's draw kick now waits for that list to be drawn. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-f942422316f63af3d64dc940b35ec8fddade0f44",
+            name = "ARMSX3 boot crash fix",
+            serial = "NPJB00337",
+            appVersion = "01.00",
+            sinceRevision = 16,
+        ),
+        // GRAND THEFT AUTO IV, BLUS30682 v01.02 and the same executable as BLUS30127 / NPUB30702
+        // v01.08 -- ours. The collision job seeds its distances with the SPU's largest float,
+        // which is a NaN on Approximate, so the first convergence test fails and Niko falls
+        // through the world; the patch uses FLT_MAX instead. ConfigDatabase.LOCAL_OVERRIDES puts
+        // these three serials on Approximate, which relies on this being on. See canary_patches.yml.
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "BLUS30682",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "BLUS30127",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "NPUB30702",
+            appVersion = "All",
+            sinceRevision = 13,
+        ),
+        // SPLATTERHOUSE, BLUS30335 and BLES01120 (one executable) -- ours. When a phase starts
+        // the game queues SPU jobs faster than its 8 job slots come back, gets a NULL slot and
+        // crashes on it; the allocator now runs the game's own dispatcher and retries instead.
+        // Needs the arm64 far-jump fix in PPUThread.cpp. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee",
+            name = "ARMSX3 phase start crash fix",
+            serial = "BLUS30335",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee",
+            name = "ARMSX3 phase start crash fix",
+            serial = "BLES01120",
+            appVersion = "All",
+            sinceRevision = 12,
+        ),
         // NBA 08, BCES00112 v01.00 -- ours. The quickplay loading screen's Lua misses its one
         // "exit after this loop" event when loading beats the screen's 6.5 s intro, which it
         // always does here and never on a PS3; the loading thread now re-sends it every frame.
@@ -538,7 +598,7 @@ object Ps3PatchRepo {
             name = "Disable MLAA(Post-processing On SPU)",
             serial = "BCES01007",
             appVersion = "01.00",
-            sinceRevision = 8,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-ae204e2198c9a051a44a69913c48f6591b811082",
@@ -552,7 +612,7 @@ object Ps3PatchRepo {
             name = "Disable MLAA (Post-processing on SPU)",
             serial = "BCES01007",
             appVersion = "01.14",
-            sinceRevision = 8,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-4836b8e74c47919f50b030ee6b47d96bc7305387",
@@ -601,21 +661,21 @@ object Ps3PatchRepo {
             name = "Freeze Fix",
             serial = "BCAS20200",
             appVersion = "01.03",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
             name = "Freeze Fix",
             serial = "BCES01141",
             appVersion = "01.03",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
             name = "Freeze Fix",
             serial = "BCES01142",
             appVersion = "01.03",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
@@ -629,7 +689,7 @@ object Ps3PatchRepo {
             name = "Freeze fix",
             serial = "BCES01908",
             appVersion = "01.00",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b",
@@ -638,61 +698,64 @@ object Ps3PatchRepo {
             appVersion = "01.00",
             sinceRevision = 4,
         ),
+        // Into the Nexus v01.01, renamed in 15 so the Artemis collection's "Freeze fix" for this
+        // executable (same change, NPUA80908 only, higher version) cannot replace it. The new
+        // name has never been offered, so all five come in at 15. See canary_patches.yml.
         Bundled(
             hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
-            name = "Freeze fix",
+            name = "Freeze fix (all regions)",
             serial = "BCUS99245",
             appVersion = "01.01",
-            sinceRevision = 4,
+            sinceRevision = 15,
         ),
         Bundled(
             hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
-            name = "Freeze fix",
+            name = "Freeze fix (all regions)",
             serial = "NPUA80908",
             appVersion = "01.01",
-            sinceRevision = 4,
+            sinceRevision = 15,
         ),
         Bundled(
             hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
-            name = "Freeze fix",
+            name = "Freeze fix (all regions)",
             serial = "BCES01908",
             appVersion = "01.01",
-            sinceRevision = 4,
+            sinceRevision = 15,
         ),
         Bundled(
             hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
-            name = "Freeze fix",
+            name = "Freeze fix (all regions)",
             serial = "BCES01949",
             appVersion = "01.01",
-            sinceRevision = 4,
+            sinceRevision = 15,
         ),
         Bundled(
             hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
-            name = "Freeze fix",
+            name = "Freeze fix (all regions)",
             serial = "NPEA00457",
             appVersion = "01.01",
-            sinceRevision = 4,
+            sinceRevision = 15,
         ),
         Bundled(
             hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
             name = "Freeze Fix",
             serial = "BCAS20052",
             appVersion = "All",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
             name = "Freeze Fix",
             serial = "BCES00301",
             appVersion = "All",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
             name = "Freeze Fix",
             serial = "NPEA00088",
             appVersion = "All",
-            sinceRevision = 4,
+            sinceRevision = 14,
         ),
         Bundled(
             hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
@@ -724,7 +787,7 @@ object Ps3PatchRepo {
      * install re-imports and enables the new ones. Not a timestamp: it has to be
      * something a diff of this file makes obvious.
      */
-    private const val BUNDLED_REVISION = 11
+    private const val BUNDLED_REVISION = 16
 
     private const val PREFS_NAME = "ARMSX2"
     private const val KEY_BUNDLED_REVISION = "ps3_bundled_patch_revision"

@@ -213,8 +213,13 @@ PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b:
     Patch:
       - [ be32, 0x005f7128, 0x4082fff4 ]
 
+# Into the Nexus v01.01 is named apart from the Artemis collection's "Freeze fix" for this same
+# executable. That one is the identical change (Juhn, 0x005f8ca8) but lists NPUA80908 alone at
+# Patch Version 1.2, and the loader keeps only the higher version of one hash and name, so with
+# Artemis installed it replaced this entry and the other four versions ran with no fix at all.
+# For NPUA80908 both can now apply; they write the same word.
 PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08:
-  "Freeze fix":
+  "Freeze fix (all regions)":
     Games:
       "Ratchet & Clank: Into the Nexus":
         BCUS99245: [ 01.01 ]
@@ -556,3 +561,169 @@ PPU-43e618448eed82aa96856338d072f1e4978c36a8:
     Patch Version: 1.0
     Patch:
       - [ be32, 0x008C2B4C, 0x38600000 ]
+
+# SPLATTERHOUSE, BLUS30335 and BLES01120 (one executable) -- ours. Crash a few seconds into a
+# phase, "Access violation reading location 0x11e" on main_thread, the same as RPCS3 #5837 in
+# 2019; upstream lists the title as Ingame.
+#
+# The game hands work to the SPUs through 8 type-0 job slots (0x1597e80, 0x180 bytes each,
+# state halfword at +0x11c: 0 free, 1 taken, 6 finished). The allocator at 0x6c7758 walks
+# them and, when all 8 are still in flight, reaches 0x6c7860 (li r31,0) and returns NULL;
+# every caller hands that NULL to the job-fill function, which reads +0x11e from it. A slot
+# only comes back after the main thread's own dispatcher (0x6c67c0) polls the SPU channels
+# and marks it 6, so when a phase starts and the jobs queue faster than they retire, the
+# 9th request crashes. On a PS3 the slots evidently never run out.
+#
+# The cave at 0x6c7860 does what the game would have done a moment later: drops the slot
+# lock, runs that dispatcher (polls, recycles finished slots, starts queued jobs), sleeps
+# 100us and searches again. It keeps the original NULL for the allocator's cleanup pass
+# (second argument != 0), for type-1 requests, for a call made from inside the dispatcher
+# (its lock depth at ctx+0x250 is non-zero) and, after 5000 tries, for good. Tested on an
+# Odin 3: the crash every time before, well past it after.
+#
+# Needs 425d0680e (the arm64 far-jump stub): without it every calloc/jump/jumpl in any
+# patch dies at fault 0x475.
+PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee:
+  "ARMSX3 phase start crash fix":
+    Games:
+      "Splatterhouse":
+        BLUS30335: [ All ]
+        BLES01120: [ All ]
+    Author: "jpolo1224"
+    Notes: "Fixes the crash a few seconds after a new phase starts."
+    Patch Version: 1.0
+    Patch:
+      - [ calloc, 0x006c7860, 0x25 ]
+      - [ be32, 0x00000000, 0x40920090 ] # bne cr4,null: a cleanup pass, keep the original
+      - [ be32, 0x00000000, 0x2f9b0000 ] # cmpwi cr7,r27,0
+      - [ be32, 0x00000000, 0x409e0088 ] # bne cr7,null: a type-1 request, keep the original
+      - [ be32, 0x00000000, 0x3d200158 ] # lis r9,0x158
+      - [ be32, 0x00000000, 0x80697e00 ] # lwz r3,0x7e00(r9): the job context
+      - [ be32, 0x00000000, 0x2f830000 ] # cmpwi cr7,r3,0
+      - [ be32, 0x00000000, 0x419e0078 ] # beq cr7,null: no context yet
+      - [ be32, 0x00000000, 0x80030250 ] # lwz r0,0x250(r3): dispatcher lock depth
+      - [ be32, 0x00000000, 0x2f800000 ] # cmpwi cr7,r0,0
+      - [ be32, 0x00000000, 0x409e006c ] # bne cr7,null: already inside the dispatcher
+      - [ be32, 0x00000000, 0x7b390002 ] # rotldi r25,r25,32: retry count in the high half
+      - [ be32, 0x00000000, 0x3b390001 ] # addi r25,r25,1
+      - [ be32, 0x00000000, 0x2b991388 ] # cmplwi cr7,r25,5000
+      - [ be32, 0x00000000, 0x7b390002 ] # rotldi r25,r25,32: slot count back in the low half
+      - [ be32, 0x00000000, 0x419d0058 ] # bgt cr7,null: give up the original way
+      - [ be32, 0x00000000, 0x813a3c20 ] # lwz r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x3929ffff ] # addi r9,r9,-1
+      - [ be32, 0x00000000, 0x913a3c20 ] # stw r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x7f83e378 ] # mr r3,r28
+      - [ jumpl, 0x00000000, 0x010acb98 ] # sys_lwmutex_unlock(slot lock)
+      - [ be32, 0x00000000, 0x3d200158 ] # lis r9,0x158
+      - [ be32, 0x00000000, 0x80697e00 ] # lwz r3,0x7e00(r9)
+      - [ be32, 0x00000000, 0x78630020 ] # clrldi r3,r3,32
+      - [ jumpl, 0x00000000, 0x006c67c0 ] # the game's dispatcher: polls the SPUs, recycles finished slots, starts queued jobs
+      - [ be32, 0x00000000, 0x38600064 ] # li r3,100
+      - [ be32, 0x00000000, 0x3960008d ] # li r11,141
+      - [ be32, 0x00000000, 0x44000002 ] # sc: sys_timer_usleep(100)
+      - [ be32, 0x00000000, 0x7f83e378 ] # mr r3,r28
+      - [ be32, 0x00000000, 0x38800000 ] # li r4,0
+      - [ jumpl, 0x00000000, 0x010acb60 ] # sys_lwmutex_lock(slot lock, 0)
+      - [ be32, 0x00000000, 0x813a3c20 ] # lwz r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x39290001 ] # addi r9,r9,1
+      - [ be32, 0x00000000, 0x913a3c20 ] # stw r9,0x3c20(r26)
+      - [ be32, 0x00000000, 0x7f5dd378 ] # mr r29,r26: back to the first slot
+      - [ be32, 0x00000000, 0x3bc00000 ] # li r30,0
+      - [ jump, 0x00000000, 0x006c77f8 ] # search again
+      - [ be32, 0x00000000, 0x3be00000 ] # null: li r31,0, the instruction this replaced; then back to 0x6c7864
+
+# GRAND THEFT AUTO IV, BLUS30682 v01.02 (Complete Edition) and the same executable sold as
+# BLUS30127 / NPUB30702 v01.08 -- ours. With SPU XFloat Accuracy on Approximate, Niko falls
+# through floors, roads and cars; RPCS3's database pins the game to Accurate for that, which
+# costs a lot of SPU time. With this patch on, ConfigDatabase.LOCAL_OVERRIDES puts these three
+# serials back on Approximate.
+#
+# The collision job SpuCollide_psn_final.task.elf starts its searches with "max distance"
+# set to 0x7FFFFFFF, the SPU's largest float (~6.8e38; the SPU has no NaN or infinity). On
+# Approximate that bit pattern is a NaN, so the search's first "still converging?" test,
+# (prev - dist) > prev * 1e-6 with prev = max (LS 0xea28..0xea54), comes out false and it
+# stops before it finds the ground. 0x7F7FFFFF (FLT_MAX) gives every test in the job the
+# same answer and is a number on both. All 14 places build the value with ilhu 0x7fff +
+# iohl 0xffff; this changes the ilhu half. None is a bit mask: every AND they meet is with
+# the xyz mask at LS 0x1d890. numeric_limits<float>::max() in .data (LS 0x1dc18) must NOT be
+# changed: lowest() is compared bit for bit against 0xffffffff "unset" fill.
+#
+# Harmless on Accurate, where both values are finite. On the Complete Edition the two
+# Episodes from Liberty City run inside this same executable as add-on content (ELC/DLC1,
+# ELC/DLC2): a Ballad of Gay Tony boot loaded the same SpuCollide and took all 14 lines. The
+# standalone Episodes from Liberty City disc is a different executable and is not covered.
+#
+# Offsets are LS addresses: apply_modification subtracts p_vaddr (0x3000).
+# Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+SPU-d0a1508208613e2184fbd64906d34d5f07890033:
+  "ARMSX3 Approximate collision fix":
+    Games:
+      "Grand Theft Auto IV":
+        BLUS30682: [ All ]
+        BLUS30127: [ All ]
+        NPUB30702: [ All ]
+    Author: "jpolo1224"
+    Notes: "Lets the game run with SPU XFloat Accuracy on Approximate without falling through the world."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x0c4f4, 0x413fbfd4 ] # ilhu r84,0x7f7f (was 0x413fffd4): FLT_MAX instead of SPU max
+      - [ be32, 0x0e3b0, 0x413fbf90 ] # ilhu r16,0x7f7f (was 0x413fff90): FLT_MAX instead of SPU max
+      - [ be32, 0x0eca0, 0x413fbfa3 ] # ilhu r35,0x7f7f (was 0x413fffa3): FLT_MAX instead of SPU max
+      - [ be32, 0x0f630, 0x413fbf82 ] # ilhu r2,0x7f7f (was 0x413fff82): FLT_MAX instead of SPU max
+      - [ be32, 0x0fa38, 0x413fbf91 ] # ilhu r17,0x7f7f (was 0x413fff91): FLT_MAX instead of SPU max
+      - [ be32, 0x10e30, 0x413fbf9b ] # ilhu r27,0x7f7f (was 0x413fff9b): FLT_MAX instead of SPU max
+      - [ be32, 0x11470, 0x413fbfde ] # ilhu r94,0x7f7f (was 0x413fffde): FLT_MAX instead of SPU max
+      - [ be32, 0x11508, 0x413fbfc4 ] # ilhu r68,0x7f7f (was 0x413fffc4): FLT_MAX instead of SPU max
+      - [ be32, 0x154b0, 0x413fbfbc ] # ilhu r60,0x7f7f (was 0x413fffbc): FLT_MAX instead of SPU max
+      - [ be32, 0x15528, 0x413fbfb2 ] # ilhu r50,0x7f7f (was 0x413fffb2): FLT_MAX instead of SPU max
+      - [ be32, 0x157a0, 0x413fbfcb ] # ilhu r75,0x7f7f (was 0x413fffcb): FLT_MAX instead of SPU max
+      - [ be32, 0x158d8, 0x413fbfa0 ] # ilhu r32,0x7f7f (was 0x413fffa0): FLT_MAX instead of SPU max
+      - [ be32, 0x17098, 0x413fbfbd ] # ilhu r61,0x7f7f (was 0x413fffbd): FLT_MAX instead of SPU max
+      - [ be32, 0x175f8, 0x413fbfcf ] # ilhu r79,0x7f7f (was 0x413fffcf): FLT_MAX instead of SPU max
+
+# THE IDOLM@STER 2, NPJB00337 v01.00 -- ours. Crash as the boot screen gives way to the logo,
+# "Access violation reading location 0x0" on NU::Draw::RequestManager (0x44ba8c). About one boot
+# in four at default settings and every boot with PPU Threads 1; the PPU interpreter only hid it
+# by being slower, it crashes there too with PPU Threads 1.
+#
+# Each frame the main thread's frame sync (0x42bd48) swaps the draw lists and wakes the draw
+# thread (KickDraw, 0x435384) to turn last frame's list into RSX commands, then goes straight on
+# to the frame's update. A draw request (vtable 0x648428) holds plain pointers to the objects it
+# draws and takes no reference, and the update is where a scene change releases its objects
+# (count at +4, Release 0x42d864). On a PS3 the draw thread starts on the other hardware thread at
+# once and is long done with the list before the update gets that far. Here the update can win: a
+# write watch on the object saw the main thread drop its count to 0 and free it 1.4 ms before the
+# draw thread called through it.
+#
+# KickDraw now waits for the draw thread to finish that list before it returns, with the game's
+# own WaitDrawIdle (0x435354, which the blocking frame sync at 0x42bee8 already calls before its
+# flip). The twelve words fit KickDraw exactly: set the draw event to 1 as before, then tail-call
+# WaitDrawIdle. Only the two frame syncs call KickDraw, on the main thread with no lock held, and
+# the draw thread clears the event as soon as the list is done, before it waits for the flip, so
+# the wait cannot deadlock. It costs the main thread one list's worth of draw thread time per
+# frame (about 0.2 ms on the logo screen).
+#
+# Tested on an Odin 3: with PPU Threads 1 the crash came on 8 of 8 boots before and 0 of 6 after;
+# 3 of 3 boots at default settings reached the title screen. The tester's crash log is the same
+# executable. Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+PPU-f942422316f63af3d64dc940b35ec8fddade0f44:
+  "ARMSX3 boot crash fix":
+    Games:
+      "THE IDOLM@STER 2":
+        NPJB00337: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Fixes the crash when the boot screen changes to the logo."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00435384, 0x7c0802a6 ] # mflr r0
+      - [ be32, 0x00435388, 0xf8010010 ] # std r0,0x10(r1)
+      - [ be32, 0x0043538c, 0xf821ff81 ] # stdu r1,-0x80(r1)
+      - [ be32, 0x00435390, 0xf8610070 ] # std r3,0x70(r1): the request manager
+      - [ be32, 0x00435394, 0x38630068 ] # addi r3,r3,0x68: its draw event
+      - [ be32, 0x00435398, 0x38800001 ] # li r4,1
+      - [ be32, 0x0043539c, 0x4bffa939 ] # bl 0x42fcd4: set the event to 1, wakes the draw thread (as before)
+      - [ be32, 0x004353a0, 0xe8610070 ] # ld r3,0x70(r1)
+      - [ be32, 0x004353a4, 0x38210080 ] # addi r1,r1,0x80
+      - [ be32, 0x004353a8, 0xe8010010 ] # ld r0,0x10(r1)
+      - [ be32, 0x004353ac, 0x7c0803a6 ] # mtlr r0
+      - [ be32, 0x004353b0, 0x4bffffa4 ] # b 0x435354: WaitDrawIdle, returns once the list is drawn

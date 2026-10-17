@@ -1923,11 +1923,37 @@ bool fs::utime(const std::string& path, s64 atime, s64 mtime)
 #endif
 }
 
-void fs::sync()
+void fs::sync(const std::string& path)
 {
 #ifdef _WIN32
+	static_cast<void>(path);
 	fs::g_tls_error = fs::error::unknown;
+#elif defined(__linux__)
+	// Only flush the filesystem containing the path: a global sync() also waits on every other mounted
+	// filesystem and may block indefinitely on a slow or stalled one (e.g. network or FUSE mounts)
+	const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+
+	if (fd == -1)
+	{
+#ifdef ANDROID
+		// A folder reached through the Storage Access Framework is not a path the kernel can
+		// open (see android/src/saf_device.h), and returning here would leave a save on it with
+		// no sync at all. Flush everything instead, as fs::sync() did before it took a path.
+		::sync();
+		fs::g_tls_error = fs::error::ok;
 #else
+		fs::g_tls_error = to_error(errno);
+#endif
+		return;
+	}
+
+	const int res = ::syncfs(fd);
+	const int err = errno;
+	::close(fd);
+
+	fs::g_tls_error = res == 0 ? fs::error::ok : to_error(err);
+#else
+	static_cast<void>(path);
 	::sync();
 	fs::g_tls_error = fs::error::ok;
 #endif

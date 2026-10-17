@@ -34,8 +34,8 @@ android {
         // agree -- an APK that installs below its core's target is a dlopen failure at boot.
         minSdk = (project.findProperty("armsx3.minSdk") as String?)?.toInt() ?: 33
         targetSdk = 37
-        versionCode = 85
-        versionName = "1.0.9.1"
+        versionCode = 91
+        versionName = "1.2.1"
 
         // ARMSX2's UI reads these. STORAGE_ALL_FILES gates the all-files storage path in
         // onboarding; IN_APP_UPDATER gates the in-app GitHub-release updater.
@@ -303,6 +303,9 @@ dependencies {
     // The net.rpcsx binding layer persists library and firmware state with
     // kotlinx-serialization.
     implementation(libs.kotlinxSerializationJson)
+
+    // Remote play (com.armsx2.remoteplay): video, audio and player 2's input between two devices.
+    implementation(libs.streamWebrtc)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

@@ -739,19 +739,24 @@ open class MainActivityRuntime : ComponentActivity() {
                     // does not spell out its title id resolves per-game settings under its
                     // filename while the core boots it as the serial and reads there. The core
                     // reports the serial about a second into boot, which is too late for the
-                    // settings just pushed above -- but recording it now means every later boot
+                    // settings just pushed above -- but recording it means every later boot
                     // resolves under the right key. See ConfigStore.rememberSerial.
-                    runCatching {
-                        com.armsx2.config.ConfigStore.rememberSerial(
-                            currentGame.value?.settingsKey,
-                            com.armsx3.NativeApp.getGameSerial())
-                    }
+                    //
+                    // Only once the core has read THIS disc. Asked here, before runVMThread, it
+                    // still answered with the last game's serial (Emulator::Kill keeps the title
+                    // id), so playing Batman: Arkham City and then The Idolm@ster 2 filed the
+                    // second under the first: it booted with Arkham's settings and saved into them.
+                    // And only for an entry without a serial, the one case the alias is for.
+                    currentGame.value?.takeIf { it.serial.isNullOrBlank() }?.settingsKey
+                        ?.let { rememberSerialAfterBoot(it) }
                     // Both of these are consumed by native when the VM boots, so they must be
                     // pushed BEFORE runVMThread (which blocks until the VM exits). One resolve,
                     // per-game ∘ global.
+                    // The plain key: resolveForGame follows the serial alias itself, the way the
+                    // settings were saved. Passing effectiveKey() here followed it twice, the same
+                    // walk past the saved settings that kept a per-game Display Resolution off.
                     val bootCfg = com.armsx2.config.ConfigStore
-                        .resolveForGame(
-                            com.armsx2.config.ConfigStore.effectiveKey(currentGame.value?.settingsKey))
+                        .resolveForGame(currentGame.value?.settingsKey)
                     // Read by VMManager::SetEmuThreadAffinities during boot.
                     runCatching { NativeApp.setAffinityMode(bootCfg.affinityMode) }
                     // The hold itself waits for the VM to come up. BIOS boots skip it.
@@ -880,8 +885,12 @@ open class MainActivityRuntime : ComponentActivity() {
             // Resolve via settingsKey (serial for discs, filename stem for
             // serial-less ELF/homebrew) so ELF per-game settings survive a reboot
             // instead of falling back to global (issue #253).
-            var resolved = com.armsx2.config.ConfigStore.resolveForGame(
-                com.armsx2.config.ConfigStore.effectiveKey(currentGame.value?.settingsKey))
+            //
+            // The plain key, as the launch path uses: resolveForGame follows the serial alias
+            // once itself (keyForGame), which is how settings are saved. An effectiveKey() here
+            // made it two hops, and for a title whose alias chains on, the renderer read another
+            // key's settings: Sonic '06 resolved hwScaler 0 with 720 saved for it.
+            var resolved = com.armsx2.config.ConfigStore.resolveForGame(currentGame.value?.settingsKey)
             // Build immutable input maps before the VM starts so the first ABXY
             // edge never pays SharedPreferences parsing on the UI thread.
             ControllerMappings.warmRuntimeCaches()
@@ -1004,6 +1013,10 @@ open class MainActivityRuntime : ComponentActivity() {
             // took effect only when changed in-game, and every relaunch came back at Screen. A
             // tester saw 14 fps at Screen and 30 at 1080p on 1.0.9, set in-game, gone on reopen.
             // Posted: it resizes the SurfaceView, and boot runs off the main thread.
+            android.util.Log.i(
+                "ARMSX3-Scaler",
+                "boot: re-applying output scale for ${currentGame.value?.settingsKey}, surface ${if (surface.value == null) "MISSING" else "present"}",
+            )
             surface.value?.let { s -> s.post { s.applyOutputScale() } }
         }
 
@@ -1710,6 +1723,35 @@ open class MainActivityRuntime : ComponentActivity() {
             })
         }
 
+        /**
+         * Alias [stem], a library entry's filename key, to the serial the core boots it as.
+         *
+         * Polled like [adoptExternalGameIdentity]: until the core is past loading, its title id is
+         * still the last game's, and recording that is what linked one game to another's settings.
+         */
+        private fun rememberSerialAfterBoot(stem: String) {
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            handler.post(object : Runnable {
+                var attempts = 0
+                override fun run() {
+                    if (vmStopInProgress || eState.value == EmuState.STOPPED) return
+                    val booted = when (runCatching { net.rpcsx.RPCSX.getState() }.getOrNull()) {
+                        net.rpcsx.EmulatorState.Ready, net.rpcsx.EmulatorState.Starting,
+                        net.rpcsx.EmulatorState.Running, net.rpcsx.EmulatorState.Paused,
+                        net.rpcsx.EmulatorState.Frozen -> true
+                        else -> false
+                    }
+                    val serial = if (!booted) null else runCatching { NativeApp.getGameSerial() }.getOrNull()
+                        ?.trim()?.uppercase()?.takeIf { it.isNotEmpty() && it != "00000000" }
+                    if (serial == null) {
+                        if (++attempts < 240) handler.postDelayed(this, 250)
+                        return
+                    }
+                    runCatching { com.armsx2.config.ConfigStore.rememberSerial(stem, serial) }
+                }
+            })
+        }
+
         /** From ARMSX2, where the VM reaching RUNNING calls it (NativeApp.vmSetPaused). Nothing in this
          *  core does: start() looks for the identity itself. A state chosen from the library is not
          *  loaded here any more: it is the boot target itself, see launchGameFromState. */
@@ -2284,15 +2326,28 @@ open class MainActivityRuntime : ComponentActivity() {
         }
         // D-pad as left analog stick: a physical d-pad press (arriving as a key,
         // not a HAT) drives the left stick instead of the digital d-pad. The
-        // remapped code is >=110 so the analog-force branch below gives a
-        // (near-)full deflection. HAT-style d-pads are folded into the stick in
-        // dispatchStick instead. 19=Up 20=Down 21=Left 22=Right ->
-        // 110=L_Up 112=L_Down 113=L_Left 111=L_Right.
+        // remapped code is a stick direction, handled just below. HAT-style
+        // d-pads are folded into the stick in dispatchStick instead.
+        // 19=Up 20=Down 21=Left 22=Right -> 110=L_Up 112=L_Down 113=L_Left 111=L_Right.
         val p_keycode = if (ControllerMappings.dpadAsLeftStick()) {
             when (p_keycode_in) {
                 19 -> 110; 20 -> 112; 21 -> 113; 22 -> 111; else -> p_keycode_in
             }
         } else p_keycode_in
+        // A KEY bound to a stick direction (d-pad-as-left-stick, or a button bound to a "(send)"
+        // stick row) deflects that direction fully, and only through the merge layer. It used to
+        // write the code itself, at 90% (a leftover "Joystic test value"), and on release wrote
+        // 0 outright: a stick still pushing that direction then read as centred, because
+        // flushAnalogAxes only resends a code whose value changed, and a stick held at its
+        // stop sends no further motion events (ARMSX3 #198: full up / full left walked).
+        if (p_keycode in 110..123 && port in analogKeyHeld.indices &&
+            (p_action == KeyEventType.KeyDown || p_action == KeyEventType.KeyUp || p_action == KeyEventType.Unknown)) {
+            val down = p_action == KeyEventType.KeyDown
+            if (down) analogKeyHeld[port][p_keycode] = 1f else analogKeyHeld[port].remove(p_keycode)
+            com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, down)
+            writeMergedAnalog(port, p_keycode)
+            return
+        }
         if (p_action == KeyEventType.KeyDown) {
             var pad_force = 0
             if (p_keycode >= 110) {
@@ -2304,17 +2359,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 // buttons while the modifier is held; 0 (full press) otherwise.
                 pad_force = com.armsx2.ui.touch.TouchControls.pressureRangeFor(p_keycode)
             }
-            // KEYS bound to an analog stick code (d-pad-as-left-stick, or a button
-            // bound to a "(send)" stick row): register the held deflection with the
-            // merge layer so a stick MOTION event can't release it mid-hold.
-            if (p_keycode in 110..123 && port in analogKeyHeld.indices)
-                analogKeyHeld[port][p_keycode] = pad_force / 32767f
             // Track for the LIVE pressure modifier (see TouchControls.notePressureKeyState).
             com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, true)
             NativeApp.setPadButtonForPort(port, p_keycode, pad_force, true)
         } else if (p_action == KeyEventType.KeyUp || p_action == KeyEventType.Unknown) {
-            if (p_keycode in 110..123 && port in analogKeyHeld.indices)
-                analogKeyHeld[port].remove(p_keycode)
             com.armsx2.ui.touch.TouchControls.notePressureKeyState(port, p_keycode, false)
             NativeApp.setPadButtonForPort(port, p_keycode, 0, false)
         }
@@ -3010,7 +3058,11 @@ open class MainActivityRuntime : ComponentActivity() {
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.TopCenter,
             ) {
-                com.armsx2.ui.friends.FriendOnlineBanner()
+                androidx.compose.foundation.layout.Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    com.armsx2.ui.friends.FriendOnlineBanner()
+                    // Remote play: a friend joining or leaving as player 2, for the host.
+                    com.armsx2.remoteplay.RemotePlayNoticeBanner()
+                }
             }
             }
         }
@@ -4876,6 +4928,22 @@ open class MainActivityRuntime : ComponentActivity() {
     private val analogAccum = HashMap<Int, Float>()
     private val analogPrevSent = Array(8) { HashMap<Int, Float>() } // per unified pad slot (multitap)
     val analogKeyHeld = Array(8) { HashMap<Int, Float>() } // written by sendKeyAction; per unified pad slot
+    private val analogMotionLast = Array(8) { HashMap<Int, Float>() } // last flush's motion-only contributions
+
+    /** Write ONE stick direction as the merge of the last motion event's contribution and any key
+     *  holding it, and record it as sent, so flushAnalogAxes' "changed?" test keeps matching what
+     *  the core holds. Used when a key changes between motion events (see sendKeyAction). */
+    private fun writeMergedAnalog(port: Int, code: Int) {
+        val v = maxOf(analogMotionLast[port][code] ?: 0f, analogKeyHeld[port][code] ?: 0f)
+        val prev = analogPrevSent[port]
+        if (v > 0f) {
+            NativeApp.setPadButtonForPort(port, code, (v * 32767).toInt(), true)
+            prev[code] = v
+        } else {
+            NativeApp.setPadButtonForPort(port, code, 0, false)
+            prev.remove(code)
+        }
+    }
 
     // ---- Gyro <-> physical-stick ADDITIVE combine (P1 / port 0) -----------
     // The aim/steer gyro drives a PS2 analog stick; so does the physical stick.
@@ -4903,6 +4971,10 @@ open class MainActivityRuntime : ComponentActivity() {
      *  (so stale codes release exactly once). */
     private fun flushAnalogAxes(port: Int) {
         val prev = analogPrevSent[port]
+        // What this event's motion contributed, before the key-held deflections are folded in,
+        // for writeMergedAnalog to merge a key change against without waiting for motion.
+        analogMotionLast[port].clear()
+        analogMotionLast[port].putAll(analogAccum)
         for ((code, held) in analogKeyHeld[port]) accumAnalog(code, held)
         // Release pass: codes we sent before but that have no contribution now.
         for (code in prev.keys) {
@@ -4939,14 +5011,17 @@ open class MainActivityRuntime : ComponentActivity() {
         val ay = abs(gy)
         if (ax >= ay) { if (ay < ax * STICK_CROSS_GATE) gy = 0f }
         else { if (ax < ay * STICK_CROSS_GATE) gx = 0f }
-        val mag = kotlin.math.hypot(gx, gy)
+        // Magnitude from the RAW vector: the snap only chooses the direction. Measured after it, a
+        // near-straight push lost the dropped axis's share and fell short of full tilt.
+        val mag = kotlin.math.hypot(vx, vy)
         if (mag <= 0f) return
         val shaped = shapeStickMag(mag.coerceAtMost(1f), left)
         // Dividing by the magnitude caps a full diagonal at the unit circle: 0.707 per axis, which
         // is what a circular-gated DualShock 3 really sends. Games that deadzone each axis on its
         // own then ignore diagonals almost entirely. Dividing by the LARGER axis instead expands
         // to the square, so a full diagonal reaches 1.0 on both. Same result on the cardinals.
-        val denom = if (ControllerMappings.stickSquareGate(left)) kotlin.math.max(abs(gx), abs(gy)) else mag
+        val denom = if (ControllerMappings.stickSquareGate(left)) kotlin.math.max(abs(gx), abs(gy))
+            else kotlin.math.hypot(gx, gy)
         val scale = if (denom > 0f) shaped / denom else 0f
         val ox = gx * scale
         val oy = gy * scale
@@ -5451,6 +5526,21 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.LibraryMusic.pause()
         // Pause-menu track was already paused by setForeground(false) at the top of onPause.
         super.onPause()
+    }
+
+    // Stopped, not paused: a split-screen or picture-in-picture app is paused but still in sight.
+    // Out of sight a locked device can sit for hours with the app on top, which Android never
+    // freezes, so everything that polls slows down until onStart (#196).
+    override fun onStart() {
+        super.onStart()
+        runCatching { NativeApp.setAppBackgrounded(false) }
+        com.armsx2.DiscordPresence.setForeground(true)
+    }
+
+    override fun onStop() {
+        runCatching { NativeApp.setAppBackgrounded(true) }
+        com.armsx2.DiscordPresence.setForeground(false)
+        super.onStop()
     }
 
     override fun onResume() {

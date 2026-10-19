@@ -269,8 +269,8 @@ public final class NativeApp {
      *
      * The JNI glue opens the driver with adrenotools_open_libvulkan and hands
      * the resulting handle to the core, which points its Vulkan dispatch table
-     * at it. Adreno only -- adrenotools patches Qualcomm's loader behaviour, and
-     * supportsCustomVulkanDriver() probes /dev/kgsl-3d0 for exactly that.
+     * at it. Adreno (Turnip on kgsl) and Mali (community PanVK builds on Arm's
+     * kbase); supportsCustomVulkanDriver() probes for either kernel interface.
      *
      * MUST be called before the renderer creates its VkInstance. Afterwards the
      * table is bound and swapping under a live device would invalidate every
@@ -278,14 +278,17 @@ public final class NativeApp {
      *
      * redirectDir is accepted for source compatibility with ARMSX2's caller but
      * is not forwarded: ADRENOTOOLS_DRIVER_FILE_REDIRECT is not enabled here.
+     *
+     * Returns whether the driver asked for is the one in use. False when a custom
+     * driver could not be loaded and the system driver runs in its place.
      */
-    public static void setCustomVulkanDriver(String driverDir, String driverName,
-                                             String redirectDir, String hookLibDir) {
+    public static boolean setCustomVulkanDriver(String driverDir, String driverName,
+                                                String redirectDir, String hookLibDir) {
         if (driverDir == null || driverDir.isEmpty()) {
             // Empty path clears the custom driver and reverts to the system one.
             net.rpcsx.RPCSX.Companion.getInstance().setCustomDriver("", "", "");
             android.util.Log.i("ARMSX3-Driver", "reverted to the system Vulkan driver");
-            return;
+            return true;
         }
 
         boolean ok = net.rpcsx.RPCSX.Companion.getInstance()
@@ -296,9 +299,10 @@ public final class NativeApp {
             android.util.Log.e("ARMSX3-Driver",
                     "custom Vulkan driver REJECTED: " + driverName + " in " + driverDir);
         }
+        return ok;
     }
 
-    /** Whether this device can load a user-supplied Vulkan driver (Adreno only). */
+    /** Whether this device has a GPU a user-supplied Vulkan driver can drive (Adreno or Mali). */
     public static boolean supportsCustomVulkanDriver() {
         try {
             return net.rpcsx.RPCSX.Companion.getInstance().supportsCustomDriverLoading();

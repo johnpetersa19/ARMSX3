@@ -239,6 +239,23 @@ open class MainActivityRuntime : ComponentActivity() {
             return if (v.startsWith("content://")) resolveTreeUriToPosix(v) else v
         }
 
+        /**
+         * [systemDirPosix], read from the saved choice instead of [systemDir]. For code that can
+         * run with ARMSX3 closed.
+         *
+         * [systemDir] is loaded by onCreate. A provider queried by another app (the Files app
+         * browsing ARMSX3's storage, a library manager asking what is installed) can start the
+         * process on its own, and then [systemDir] is still null, which reads as the internal
+         * default: with the data folder on an SD card, the Files app showed the internal folder,
+         * and games dropped there never reached the emulator. Setup writes the preference and
+         * [systemDir] together, so in a running app the two agree.
+         */
+        fun savedSystemDirPosix(context: Context): String? {
+            val v = context.getSharedPreferences("ARMSX2", Context.MODE_PRIVATE)
+                .getString("systemDir", null) ?: return null
+            return if (v.startsWith("content://")) resolveTreeUriToPosix(v) else v
+        }
+
         /** `<DataRoot>/inputprofiles/` — the portable folder both touch-layout and
          *  controller-mapping profiles mirror themselves into, so they survive a
          *  data-folder move and can be shared or hand-dropped. Null when no system
@@ -950,7 +967,15 @@ open class MainActivityRuntime : ComponentActivity() {
                 } else null
             // Turnip options go into the environment before the device is created.
             com.armsx2.CustomDriver.applyDriverEnv()
-            if (ctx != null) com.armsx2.CustomDriver.applyToNative(ctx, picked)
+            if (ctx != null && !com.armsx2.CustomDriver.applyToNative(ctx, picked) && picked != null) {
+                // The pack could not be loaded and the system driver runs in its place. Said here
+                // because nothing else would: the game starts and plays, on a driver the player
+                // did not pick, and a pack that never loaded gets reported as working.
+                val notice = com.armsx2.i18n.I18n.get("backend.driver.notLoaded")
+                instance?.runOnUiThread {
+                    android.widget.Toast.makeText(ctx, notice, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
             when (renderer.value) {
                 "vulkan" -> NativeApp.renderVulkan()
                 "opengl" -> NativeApp.renderOpenGL()
@@ -1778,10 +1803,13 @@ open class MainActivityRuntime : ComponentActivity() {
          * launch and a later change to the folder does not put a working install back into
          * setup.
          */
-        private fun adoptPreparedSetup() {
+        private fun adoptPreparedSetup(context: Context) {
             if (setupComplete.value) return
 
-            val root = currentInitDataRoot()?.takeIf { it.isNotBlank() } ?: return
+            // Resolved the way kickoffEmucoreInit pins it. The pinned root is only recorded by that
+            // init, which waits for setupComplete, so on the fresh install this exists for it was
+            // still null and the check gave up before looking (ARMSX3 #205, traced by carter-lilley).
+            val root = currentInitDataRoot()?.takeIf { it.isNotBlank() } ?: assetCopyRoot(context)
             val config = File(root, "config")
 
             // The same file boot checks before starting the XMB, so "firmware is installed"
@@ -2530,6 +2558,7 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.SecondScreen.attach(applicationContext)
         com.armsx2.BatteryWatcher.load()
         com.armsx2.BatteryWatcher.start(applicationContext)
+        com.armsx2.packages.ShareInstalled.load()
         // Restore the saved rumble master toggle into the native gate (NativeApp.onPadRumble).
         NativeApp.sRumbleEnabled = ControllerMappings.rumbleEnabled()
         NativeApp.sPhoneRumbleEnabled = ControllerMappings.phoneRumbleEnabled()
@@ -2566,7 +2595,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (legacy != null) listOf(legacy) else emptyList()
             }
         }
-        adoptPreparedSetup()
+        adoptPreparedSetup(applicationContext)
         runCatching { com.armsx2.TrophySound.load() }
         // Setup recovery. Auto Backup can restore our prefs (incl. setupComplete + the
         // ROMs URIs) on reinstall, but SAF/all-files PERMISSIONS are never backed up — so
@@ -2574,7 +2603,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // the user in an empty library with the wizard skipped. If no configured ROMs
         // folder is actually reachable, drop setupComplete for this session so the wizard
         // re-runs (and re-requests the permission); finishSetup re-arms it.
-        if (setupComplete.value && !romsAccessible(this, romsDirs.value)) {
+        // Only when there IS a ROMs folder to lose. An install with none keeps its games in the data
+        // folder (a launcher's, see adoptPreparedSetup), and romsAccessible counts an empty list as
+        // lost, which put the wizard straight back after the skip.
+        if (setupComplete.value && romsDirs.value.isNotEmpty() && !romsAccessible(this, romsDirs.value)) {
             setupComplete.value = false
             setupRecoveryNeeded.value = true
         }
@@ -3426,9 +3458,13 @@ open class MainActivityRuntime : ComponentActivity() {
             // model (HomeInputController). It must yield when something is layered
             // ON TOP of the library — the nav drawer, an in-game manager screen, or
             // the pause overlay — so those own the pad instead of the grid behind.
+            // Likewise a modal that claims its own nav layer (ConfirmOverlay, the
+            // install another app asked for): without this the grid kept the pad
+            // behind the question, B opened the drawer and A started the game under it.
             if (!WindowImpl.overlayVisible.value &&
                 WindowImpl.inGameScreen.value == null &&
                 !com.armsx2.navigation.UiNavigator.drawerOpen.value &&
+                com.armsx2.ui.settings.SettingsControllerNav.activeLayer.value == null &&
                 com.armsx2.ui.home.HomeInputController.active()
             ) {
                 // Square button (or the Menu hotkey) opens settings for the
@@ -3703,15 +3739,12 @@ open class MainActivityRuntime : ComponentActivity() {
         //
         // Deliberately keyed on the PHYSICAL code before remapping: what decides ownership is
         // how the hardware reports the trigger, not what the user bound it to.
+        //
+        // "Where there is an axis" means an axis that has moved, not one the pad merely lists: see
+        // liveTriggerAxes. A listed axis that never moves leaves these keys in charge.
         if (physicalCode == KeyEvent.KEYCODE_BUTTON_L2 || physicalCode == KeyEvent.KEYCODE_BUTTON_R2)
         {
-            val isLeft = physicalCode == KeyEvent.KEYCODE_BUTTON_L2
-            val axisA = if (isLeft) MotionEvent.AXIS_LTRIGGER else MotionEvent.AXIS_RTRIGGER
-            val axisB = if (isLeft) MotionEvent.AXIS_BRAKE else MotionEvent.AXIS_GAS
-            val axisC = if (isLeft) -1 else rightTriggerExtraAxis(event.deviceId)
-
-            if (deviceHasAxis(event.deviceId, axisA) || deviceHasAxis(event.deviceId, axisB) ||
-                deviceHasAxis(event.deviceId, axisC))
+            if (triggerAxisLive(event.deviceId, physicalCode == KeyEvent.KEYCODE_BUTTON_L2))
             {
                 return true
             }
@@ -4246,7 +4279,7 @@ open class MainActivityRuntime : ComponentActivity() {
             // instead — take the max so we handle whichever the device
             // actually emits without double-driving when both are present.
             sendTrigger(ev, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE,
-                KeyEvent.KEYCODE_BUTTON_L2, port)
+                KeyEvent.KEYCODE_BUTTON_L2, port, axisC = leftTriggerExtraAxis(ev.deviceId))
             sendTrigger(ev, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS,
                 KeyEvent.KEYCODE_BUTTON_R2, port, axisC = rightTriggerExtraAxis(ev.deviceId))
             // Physical STICK DIRECTIONS bound to a PS2 control via the "(send)"
@@ -4355,6 +4388,23 @@ open class MainActivityRuntime : ComponentActivity() {
         val rz = runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(MotionEvent.AXIS_RZ) }.getOrNull()
         if (rz != null && rz.min >= 0f) MotionEvent.AXIS_RZ else -1
     }
+    // The left-hand twin: the same pads put the left trigger on AXIS_Z. Again only when Z is a 0..1
+    // range, because a real right-stick-X spans -1..1. -1 = no such axis.
+    private val leftTriggerAxisCache = HashMap<Int, Int>()
+    private fun leftTriggerExtraAxis(deviceId: Int): Int = leftTriggerAxisCache.getOrPut(deviceId) {
+        val z = runCatching { InputDevice.getDevice(deviceId)?.getMotionRange(MotionEvent.AXIS_Z) }.getOrNull()
+        if (z != null && z.min >= 0f) MotionEvent.AXIS_Z else -1
+    }
+
+    // Trigger axes that have actually moved past the dead zone, per controller and side. A pad can
+    // list analog trigger axes and still deliver its triggers only as L2/R2 key events (an AYANEO
+    // Pocket DS, ARMSX3 #206): trusting the axes because they were listed dropped the keys and read
+    // an axis that never moves, so L2/R2 were dead in every game. Until a side's axis moves, that
+    // side's keys drive the trigger and sendTrigger writes nothing. Main thread only, like the caches
+    // above; device ids are new on every reconnect, so a re-paired pad starts over.
+    private val liveTriggerAxes = HashSet<Long>()
+    private fun liveTriggerKey(deviceId: Int, left: Boolean): Long = (deviceId.toLong() shl 1) or (if (left) 1L else 0L)
+    private fun triggerAxisLive(deviceId: Int, left: Boolean): Boolean = liveTriggerKey(deviceId, left) in liveTriggerAxes
 
     private var lastStickProbeMs = 0L
     private fun debugStickProbe(ev: MotionEvent) {
@@ -4477,6 +4527,9 @@ open class MainActivityRuntime : ComponentActivity() {
         val nav = com.armsx2.navigation.UiNavigator
         val onHome = nav.route.value == com.armsx2.navigation.AppRoute.Home
         when {
+            // An install another app asked for (issue #188) sits over every screen, so its
+            // question is what B answers, not the screen behind it.
+            com.armsx2.packages.ExternalInstall.showing.value != null -> com.armsx2.packages.ExternalInstall.cancel()
             nav.drawerOpen.value -> nav.drawerOpen.value = false
             WindowImpl.inGameScreen.value != null -> WindowImpl.dismissInGameScreen()
             WindowImpl.showLibrary.value && !onHome -> nav.back()
@@ -4538,9 +4591,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.ui.emulation.EmulationMenuInputController.move(dx, dy)
             }
             // Library cover grid — only when it actually owns input (same gate as
-            // the key path: not behind the drawer / an in-game screen).
+            // the key path: not behind the drawer / an in-game screen / a modal).
             WindowImpl.inGameScreen.value == null &&
                 !com.armsx2.navigation.UiNavigator.drawerOpen.value &&
+                com.armsx2.ui.settings.SettingsControllerNav.activeLayer.value == null &&
                 com.armsx2.ui.home.HomeInputController.active() -> {
                 com.armsx2.ui.home.HomeInputController.move(dx, dy)
             }
@@ -4772,7 +4826,10 @@ open class MainActivityRuntime : ComponentActivity() {
         // Same axis pairs the gameplay path uses (sendTrigger), including the per-device third
         // axis some pads put the right trigger on, so a trigger that works in game can be bound.
         // Threshold is a deliberate half-pull: resting drift on a worn trigger must not self-bind.
-        val capLt = maxOf(ev.getAxisValue(MotionEvent.AXIS_LTRIGGER), ev.getAxisValue(MotionEvent.AXIS_BRAKE))
+        var capLt = maxOf(ev.getAxisValue(MotionEvent.AXIS_LTRIGGER), ev.getAxisValue(MotionEvent.AXIS_BRAKE))
+        leftTriggerExtraAxis(ev.deviceId).takeIf { it >= 0 }?.let { extra ->
+            capLt = maxOf(capLt, ev.getAxisValue(extra))
+        }
         var capRt = maxOf(ev.getAxisValue(MotionEvent.AXIS_RTRIGGER), ev.getAxisValue(MotionEvent.AXIS_GAS))
         rightTriggerExtraAxis(ev.deviceId).takeIf { it != 0 }?.let { extra ->
             capRt = maxOf(capRt, ev.getAxisValue(extra))
@@ -5409,11 +5466,19 @@ open class MainActivityRuntime : ComponentActivity() {
         // keycode binding path, so clearing/remapping them in the Pad tab was ignored.
         // Resolve the physical trigger keycode to its mapped PS2 target — null = cleared,
         // so the trigger is disabled; otherwise drive the resolved (possibly remapped) code.
-        val target = ControllerMappings.targetForPhysical(code, port) ?: return
         val raw = maxOf(
             maxOf(event.getAxisValue(axisA), event.getAxisValue(axisB)),
             if (axisC >= 0) event.getAxisValue(axisC) else 0f,
         ).coerceIn(0f, 1f)
+        // Until this side's axis has moved on this controller, its L2/R2 keys are in charge
+        // (liveTriggerAxes), and writing "released" here on every stick event would cancel a held
+        // key press, the same shape as the no-axis case above.
+        val left = code == KeyEvent.KEYCODE_BUTTON_L2
+        if (!triggerAxisLive(event.deviceId, left)) {
+            if (raw <= TRIGGER_DEAD) return
+            liveTriggerAxes.add(liveTriggerKey(event.deviceId, left))
+        }
+        val target = ControllerMappings.targetForPhysical(code, port) ?: return
         val out = if (raw <= TRIGGER_DEAD) 0f else (raw - TRIGGER_DEAD) / (1f - TRIGGER_DEAD)
         if (target in 110..123) {
             // Trigger bound to a PS2 STICK direction ("(send)" rows): contribute the
@@ -5441,7 +5506,7 @@ open class MainActivityRuntime : ComponentActivity() {
     private fun triggerTravel(ev: MotionEvent, left: Boolean): Float {
         val a = if (left) MotionEvent.AXIS_LTRIGGER else MotionEvent.AXIS_RTRIGGER
         val b = if (left) MotionEvent.AXIS_BRAKE else MotionEvent.AXIS_GAS
-        val c = if (left) -1 else rightTriggerExtraAxis(ev.deviceId)
+        val c = if (left) leftTriggerExtraAxis(ev.deviceId) else rightTriggerExtraAxis(ev.deviceId)
         if (!deviceHasAxis(ev.deviceId, a) && !deviceHasAxis(ev.deviceId, b) &&
             !deviceHasAxis(ev.deviceId, c))
             return -1f
@@ -5604,6 +5669,9 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     private fun handleExternalLaunchIntent(intent: Intent?) {
+        // An install another app asked for (issue #188), which carries no game. Taken first so
+        // nothing below can read it as a launch.
+        if (com.armsx2.packages.ExternalInstall.accept(intent)) return
         val launched = extractLaunchUri(intent) ?: return
         persistReadGrant(intent, launched)
         // A .ps3 shortcut handed over as a file stands for the installed game its title id names.

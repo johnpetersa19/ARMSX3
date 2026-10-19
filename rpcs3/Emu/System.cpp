@@ -1292,7 +1292,7 @@ game_boot_result Emulator::BootGame(const std::string& path, const std::string& 
 	m_db_config = db_config;
 
 	// Handle files and special paths inside Load unmodified
-	if (direct || !fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (direct || !fs::is_dir(path) || is_iso_file(path))
 	{
 		m_path = path;
 
@@ -5117,7 +5117,7 @@ game_boot_result Emulator::AddGame(std::string path, bool is_iso)
 	fmt::trim_back(path, fs::delim);
 
 	// Handle files directly
-	if (!fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (!fs::is_dir(path) || is_iso_file(path))
 	{
 		return AddGameToYml(path, is_iso);
 	}
@@ -5660,34 +5660,45 @@ static std::string write_config_file(const fs::file& file, std::string_view data
 #endif
 }
 
-void Emulator::SaveSettings(std::string_view settings, const std::string& title_id)
+static std::string settings_file_path(const std::string& title_id)
 {
-	std::string config_name;
+	return title_id.empty() ? fs::get_config_dir(true) + "config.yml" : rpcs3::utils::get_custom_config_path(title_id);
+}
 
-	if (title_id.empty())
-	{
-		config_name = fs::get_config_dir(true) + "config.yml";
-	}
-	else
-	{
-		config_name = rpcs3::utils::get_custom_config_path(title_id);
-	}
+bool Emulator::SaveSettingsFile(std::string_view settings, const std::string& title_id)
+{
+	const std::string config_name = settings_file_path(title_id);
 
 	// Save config atomically
 	fs::pending_file temp(config_name);
 	if (!temp.file)
 	{
 		sys_log.error("Could not save config to %s (failed to create temporary file) (error=%s)", config_name, fs::g_tls_error);
+		return false;
 	}
-	else if (const std::string failed = write_config_file(temp.file, settings); !failed.empty())
+
+	if (const std::string failed = write_config_file(temp.file, settings); !failed.empty())
 	{
-		// Not committed, so the config on disk stays as it was. The settings still apply below.
+		// Not committed, so the config on disk stays as it was.
 		sys_log.error("Could not save config to %s (%s)", config_name, failed);
+		return false;
 	}
-	else if (!temp.commit())
+
+	if (!temp.commit())
 	{
 		sys_log.error("Could not save config to %s (failed to commit) (error=%s)", config_name, fs::g_tls_error);
+		return false;
 	}
+
+	return true;
+}
+
+void Emulator::SaveSettings(std::string_view settings, const std::string& title_id)
+{
+	const std::string config_name = settings_file_path(title_id);
+
+	// A failed save leaves the file as it was. The settings still apply below.
+	SaveSettingsFile(settings, title_id);
 
 	// Check if the running config/title is the same as the edited config/title.
 	if (config_name == g_cfg.name || title_id == Emu.GetTitleID())
